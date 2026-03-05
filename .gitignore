@@ -1,0 +1,41 @@
+# macOS system files
+.DS_Store
+
+# Python cache and temporary files
+__pycache__/
+*.pyc
+*.npy
+*.index
+*.pyo
+.ipynb_checkpoints/
+
+# VSCode editor configuration
+.vscode/
+
+# 环境变量（含API Key，严禁提交）
+.env
+
+# 依赖虚拟环境
+.venv/
+
+# Runtime and download caches
+corpora/
+logs/
+# 大数据文件（Excel原始数据）
+data/*.xlsx
+data/*.csv
+data/*.xls
+
+# 模型运行输出（结果可本地保存，不上传）
+data/output_v2_*/
+data/output_chat/
+
+# uv 安装的临时 wheel 包（如 =0.1.0 这类）
+=*/
+
+# 项目目录内的其他 git 仓库（UltraRAG 等依赖）
+github.com/
+
+# 单次运行的输出结果
+data/output_v2_single/
+data/output_v2_batch/

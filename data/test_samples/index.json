@@ -1,0 +1,23 @@
+[
+  {
+    "sample_id": 1,
+    "label": "status0_81_чФ╖",
+    "file": "sample_1_status0_81_чФ╖.json",
+    "age": "81",
+    "sex": "男"
+  },
+  {
+    "sample_id": 2,
+    "label": "status1_100_чФ╖",
+    "file": "sample_2_status1_100_чФ╖.json",
+    "age": "100",
+    "sex": "男"
+  },
+  {
+    "sample_id": 3,
+    "label": "status2_102_хе│",
+    "file": "sample_3_status2_102_хе│.json",
+    "age": "102",
+    "sex": "女"
+  }
+]
