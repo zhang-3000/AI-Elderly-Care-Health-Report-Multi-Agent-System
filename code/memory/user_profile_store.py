@@ -191,6 +191,10 @@ class UserProfileStore:
         if row is None:
             return []
         return json.loads(row["messages"])
+    
+    def get_session_history(self, session_id: str) -> list:
+        """获取会话的对话历史（别名方法）"""
+        return self.get_session_messages(session_id)
 
     def get_session(self, session_id: str) -> Optional[Dict]:
         """根据 session_id 获取会话信息"""

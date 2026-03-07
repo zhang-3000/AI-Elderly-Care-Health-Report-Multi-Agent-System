@@ -186,22 +186,35 @@ class ConversationManager:
     ) -> Tuple[str, SessionState]:
         """GREETING → 尝试从打招呼消息中提取信息，然后进入 COLLECTING"""
 
-        # 先尝试提取 G1（基本信息）字段
-        g1 = QUESTION_GROUPS[0]
-        updates = self.extractor.extract(user_message, g1["fields"], history)
+        # 尝试从用户消息中提取所有可能的字段（不限于第一组）
+        all_fields = []
+        for group in QUESTION_GROUPS:
+            all_fields.extend(group["fields"])
+        
+        updates = self.extractor.extract(user_message, all_fields, history)
         if updates:
             self.store.update_profile(user_id, updates)
 
-        # 进入 COLLECTING，问第一个有缺失的分组
+        # 检查缺失情况
         missing = self.store.get_missing_fields(user_id)
+        
+        if not missing:
+            # 用户一次性说完了所有信息，直接进入确认
+            return self._ready_to_confirm(user_id)
+
+        # 找到第一个有缺失的分组
         group_idx = self._find_current_group_idx(missing)
         self._session_cache[session_id]["current_group_idx"] = group_idx
 
-        if not missing:
-            # 极少情况：打招呼时就说完了所有信息
-            return self._ready_to_confirm(user_id)
-
-        reply = self._build_greeting_reply(missing, group_idx)
+        # 如果用户已经提供了很多信息，不要再显示完整的欢迎语
+        completion_rate = self.store.get_completion_rate(user_id)
+        if completion_rate > 0.3:  # 如果已经填了30%以上
+            # 直接进入收集模式，追问缺失的部分
+            reply = self._build_followup_reply(user_id, missing, group_idx, history)
+        else:
+            # 显示完整欢迎语
+            reply = self._build_greeting_reply(missing, group_idx)
+        
         return reply, SessionState.COLLECTING
 
     def _handle_collecting(
@@ -212,8 +225,18 @@ class ConversationManager:
         ctx = self._session_cache[session_id]
         current_group_idx = ctx.get("current_group_idx", 0)
 
-        # 获取当前分组需要提取的字段（包含当前组 + 可能的补充）
-        target_fields = self._get_target_fields_for_extraction(user_id, current_group_idx)
+        # 优化：尝试从用户回答中提取所有可能的字段，不只是当前分组
+        missing = self.store.get_missing_fields(user_id)
+        all_missing_fields = []
+        for fields in missing.values():
+            all_missing_fields.extend(fields)
+        
+        # 如果用户提供了大量信息，尝试提取所有缺失字段
+        if len(user_message) > 100:  # 长回答，可能包含多个分组的信息
+            target_fields = all_missing_fields[:50]  # 最多提取50个字段
+        else:
+            # 短回答，只提取当前分组及前面遗漏的字段
+            target_fields = self._get_target_fields_for_extraction(user_id, current_group_idx)
 
         # 从用户回答中提取字段
         updates = self.extractor.extract(user_message, target_fields, history[-8:])

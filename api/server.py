@@ -861,7 +861,7 @@ async def health_check():
 
 # ==================== 注册路由 ====================
 
-app.include_router(api_router)
+app.include_router(api_router)  # api_router 已经有 prefix="/api"
 app.include_router(chat_router)
 app.include_router(report_router)
 

@@ -29,6 +29,11 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
+# 临时清除代理环境变量（因为 Cursor 的代理返回 403）
+for key in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']:
+    if key in os.environ:
+        del os.environ[key]
+
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
 
@@ -124,11 +129,12 @@ class UserProfile:
 
 # ============ Agent 基类 ============
 class BaseAgent:
-    """Agent 基类"""
+    """Agent 基类（增强版 - 支持 RAG）"""
     
-    def __init__(self, name: str, system_prompt: str):
+    def __init__(self, name: str, system_prompt: str, knowledge_agent=None):
         self.name = name
         self.system_prompt = system_prompt
+        self.knowledge_agent = knowledge_agent  # 可选的知识检索能力
     
     def call_llm(self, user_prompt: str, temperature: float = 0.3) -> str:
         """调用 LLM"""
@@ -145,6 +151,46 @@ class BaseAgent:
             return response.choices[0].message.content.strip()
         except Exception as e:
             return f"Error: {str(e)}"
+    
+    def call_llm_with_rag(
+        self, 
+        user_prompt: str, 
+        rag_query: Optional[str] = None,
+        rag_top_k: int = 2,
+        temperature: float = 0.3
+    ) -> str:
+        """
+        调用 LLM，可选地使用 RAG 增强
+        
+        Args:
+            user_prompt: 用户提示词
+            rag_query: RAG 检索查询（如果为 None 则不使用 RAG）
+            rag_top_k: RAG 返回结果数量
+            temperature: LLM 温度参数
+        
+        Returns:
+            LLM 响应文本
+        """
+        # 如果提供了 RAG 查询且知识代理可用
+        if rag_query and self.knowledge_agent:
+            try:
+                rag_result = self.knowledge_agent.retrieve(rag_query, top_k=rag_top_k)
+                knowledge_context = rag_result.get('context', '')
+                
+                if knowledge_context:
+                    # 将知识注入到 prompt 中
+                    enhanced_prompt = f"""{user_prompt}
+
+【专业知识参考】
+{knowledge_context}
+
+请结合以上专业标准和指南进行分析，确保建议的科学性和权威性。"""
+                    user_prompt = enhanced_prompt
+            except Exception as e:
+                print(f"⚠️ {self.name} RAG 检索失败: {e}")
+        
+        # 调用 LLM
+        return self.call_llm(user_prompt, temperature)
 
     
     def parse_json(self, text: str) -> Dict:
@@ -282,7 +328,7 @@ class RiskAgentV2(BaseAgent):
         super().__init__("RiskAgentV2", system_prompt)
     
     def predict(self, profile: UserProfile, current_status: int) -> Dict:
-        """预测风险"""
+        """预测风险（增强版 - 支持 RAG）"""
         risk_factors = f"""
 【基本信息】
 当前失能状态: {current_status} (0=无失能, 1=部分失能, 2=严重失能)
@@ -335,7 +381,33 @@ class RiskAgentV2(BaseAgent):
 - 照护者: {profile.caregiver}
 - 医保: {profile.medical_insurance}
 """
-        result = self.call_llm(f"请评估以下老人的短期和中期风险：\n{risk_factors}")
+        
+        # 构建 RAG 查询：针对高风险因素
+        rag_query = None
+        if self.knowledge_agent:
+            # 识别关键风险因素
+            risk_keywords = []
+            age = int(profile.age) if profile.age else 0
+            if age >= 85:
+                risk_keywords.append("高龄老人")
+            if profile.stroke in ["是", "有"]:
+                risk_keywords.append("中风")
+            if profile.heart_disease in ["是", "有"]:
+                risk_keywords.append("心脏病")
+            if profile.diabetes in ["是", "有"]:
+                risk_keywords.append("糖尿病")
+            if current_status >= 1:
+                risk_keywords.append("失能")
+            
+            if risk_keywords:
+                rag_query = f"{age}岁 {' '.join(risk_keywords[:3])} 风险预防 健康标准"
+        
+        # 使用 RAG 增强的 LLM 调用
+        result = self.call_llm_with_rag(
+            f"请评估以下老人的短期和中期风险：\n{risk_factors}",
+            rag_query=rag_query,
+            rag_top_k=2
+        )
         return self.parse_json(result)
 
 
@@ -516,7 +588,7 @@ class ActionPlanAgent(BaseAgent):
     def generate(self, profile: UserProfile, status_result: Dict,
                  risk_result: Dict, factor_result: Dict,
                  knowledge_context: str = "") -> Dict:
-        """生成行动计划"""
+        """生成行动计划（增强版 - 支持 RAG）"""
         context = f"""
 【用户画像】
 年龄: {profile.age}岁, 性别: {profile.sex}
@@ -558,6 +630,30 @@ class ActionPlanAgent(BaseAgent):
 5. 情绪与社交
 6. 照护资源对接
 """
+        
+        # 构建 RAG 查询：针对最紧迫的行动需求
+        rag_query = None
+        if self.knowledge_agent:
+            # 提取高风险项
+            high_risks = [r for r in risk_result.get('short_term_risks', []) 
+                         if r.get('severity') == '高']
+            
+            age = int(profile.age) if profile.age else 0
+            
+            if high_risks:
+                # 针对高风险生成查询
+                risk_name = high_risks[0].get('risk', '')
+                rag_query = f"{age}岁老人 {risk_name} 预防措施 具体方法"
+            else:
+                # 针对慢性病管理生成查询
+                diseases = []
+                if profile.hypertension in ["是", "有"]:
+                    diseases.append("高血压")
+                if profile.diabetes in ["是", "有"]:
+                    diseases.append("糖尿病")
+                if diseases:
+                    rag_query = f"老年人 {' '.join(diseases[:2])} 日常管理 居家照护"
+        
         if knowledge_context:
             context += f"""
 
@@ -566,7 +662,13 @@ class ActionPlanAgent(BaseAgent):
 
 {knowledge_context}
 """
-        result = self.call_llm(context)
+        
+        # 使用 RAG 增强的 LLM 调用
+        result = self.call_llm_with_rag(
+            context,
+            rag_query=rag_query,
+            rag_top_k=2
+        )
         return self.parse_json(result)
 
 
@@ -811,28 +913,47 @@ C级（第三优先）: {priority_result.get('priority_c', [])}
 
 # ============ 调度中心 Orchestrator V2 ============
 class OrchestratorAgentV2:
-    """调度中心 V2 - 协调7个Agent的执行"""
+    """调度中心 V2 - 协调7个Agent的执行（增强版 - RAG 深度融合）"""
     
     def __init__(self):
-        self.status_agent = StatusAgent()
-        self.risk_agent = RiskAgentV2()
-        self.factor_agent = FactorAgentV2()
-        self.action_agent = ActionPlanAgent()
-        self.priority_agent = PriorityAgent()
-        self.review_agent = ReviewAgent()
-        self.report_agent = ReportAgentV2()
+        # 首先初始化知识代理
         self.knowledge_agent = self._init_knowledge_agent()
+        
+        # 初始化各个 Agent，并传递知识代理
+        self.status_agent = StatusAgent()
+        self.status_agent.knowledge_agent = self.knowledge_agent
+        
+        self.risk_agent = RiskAgentV2()
+        self.risk_agent.knowledge_agent = self.knowledge_agent
+        
+        self.factor_agent = FactorAgentV2()
+        self.factor_agent.knowledge_agent = self.knowledge_agent
+        
+        self.action_agent = ActionPlanAgent()
+        self.action_agent.knowledge_agent = self.knowledge_agent
+        
+        self.priority_agent = PriorityAgent()
+        self.priority_agent.knowledge_agent = self.knowledge_agent
+        
+        self.review_agent = ReviewAgent()
+        self.review_agent.knowledge_agent = self.knowledge_agent
+        
+        self.report_agent = ReportAgentV2()
+        self.report_agent.knowledge_agent = self.knowledge_agent
 
     def _init_knowledge_agent(self):
+        """初始化知识代理（使用新的 KnowledgeAgent）"""
         if not RAG_ENABLED or PageIndexRAGAgent is None:
             return None
         if not RAG_INDEX_PATH.exists():
             print(f"⚠️ RAG 已启用，但索引文件不存在: {RAG_INDEX_PATH}")
             return None
         try:
-            return PageIndexRAGAgent(index_path=str(RAG_INDEX_PATH))
+            from knowledge_agent import KnowledgeAgent
+            rag_agent = PageIndexRAGAgent(index_path=str(RAG_INDEX_PATH))
+            return KnowledgeAgent(rag_agent)
         except Exception as error:
-            print(f"⚠️ RAG Agent 初始化失败: {error}")
+            print(f"⚠️ Knowledge Agent 初始化失败: {error}")
             return None
     
     def run(self, profile: UserProfile, verbose: bool = True) -> Dict:
@@ -865,25 +986,38 @@ class OrchestratorAgentV2:
         if verbose:
             print(f"   → 主要问题数: {len(results['factors'].get('main_problems', []))}")
 
-        # Stage 3.5: RAG 知识检索（可选）
+        # Stage 3.5: RAG 知识检索（可选 - 使用新的 KnowledgeAgent）
         if self.knowledge_agent is not None:
             if verbose:
-                print("📚 Stage 3.5: RAG 知识检索 Agent 执行中...")
-            results['knowledge'] = self.knowledge_agent.retrieve_for_profile(
+                print("📚 Stage 3.5: 知识检索 Agent 执行中...")
+            results['knowledge'] = self.knowledge_agent.retrieve_comprehensive(
                 profile,
                 results['status'],
                 results['risk'],
                 results['factors'],
                 top_k=RAG_TOP_K,
             )
-            knowledge_context = results['knowledge'].get('context', '')
+            knowledge_context = results['knowledge'].get('combined_context', '')
             if verbose:
-                print(f"   → 命中文档片段数: {len(results['knowledge'].get('hits', []))}")
+                total_hits = results['knowledge'].get('total_hits', 0)
+                print(f"   → 总命中文档片段数: {total_hits}")
+                risk_hits = len(results['knowledge'].get('risk_prevention', {}).get('hits', []))
+                disease_hits = len(results['knowledge'].get('disease_management', {}).get('hits', []))
+                training_hits = len(results['knowledge'].get('functional_training', {}).get('hits', []))
+                if risk_hits > 0:
+                    print(f"   → 风险预防知识: {risk_hits}条")
+                if disease_hits > 0:
+                    print(f"   → 疾病管理知识: {disease_hits}条")
+                if training_hits > 0:
+                    print(f"   → 功能训练知识: {training_hits}条")
         else:
             results['knowledge'] = {
                 "enabled": False,
-                "hits": [],
-                "context": "",
+                "risk_prevention": {"hits": [], "context": ""},
+                "disease_management": {"hits": [], "context": ""},
+                "functional_training": {"hits": [], "context": ""},
+                "combined_context": "",
+                "total_hits": 0
             }
         
         # Stage 4: 行动计划生成（新增）
