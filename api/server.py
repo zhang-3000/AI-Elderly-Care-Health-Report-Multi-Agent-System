@@ -65,6 +65,7 @@ conversation_manager: Optional[ConversationManager] = None
 
 # 全局工作区管理器
 workspace_manager: Optional[WorkspaceManager] = None
+RAG_ENABLED = os.getenv("RAG_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def save_report(
@@ -662,11 +663,15 @@ async def stream_report(request: ReportGenerateRequest):
             # 将耗时工作流放入后台线程，主协程持续推送进度事件，避免前端长时间无响应
             workflow_task = asyncio.create_task(asyncio.to_thread(orchestrator.run, profile))
 
-            agent_stages = ["status", "risk", "factors", "actions", "priority", "review", "report"]
+            agent_stages = ["status", "risk", "factors"]
+            if RAG_ENABLED:
+                agent_stages.append("knowledge")
+            agent_stages.extend(["actions", "priority", "review", "report"])
             stage_messages = {
                 "status": "正在判定功能状态...",
                 "risk": "正在进行风险预测...",
                 "factors": "正在提取关键影响因素...",
+                "knowledge": "正在检索知识库参考...",
                 "actions": "正在生成干预行动建议...",
                 "priority": "正在排序建议优先级...",
                 "review": "正在进行结果复核...",

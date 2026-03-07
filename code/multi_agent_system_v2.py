@@ -17,12 +17,32 @@ from openai import OpenAI
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
+from pathlib import Path
+
+try:
+    from rag import PageIndexRAGAgent
+except Exception:
+    PageIndexRAGAgent = None
 
 # DeepSeek API 配置 - 优先使用环境变量
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+RAG_ENABLED = _env_flag("RAG_ENABLED", False)
+DEFAULT_RAG_INDEX_PATH = Path(__file__).resolve().parent.parent / "data" / "rag_indexes" / "default_index.json"
+RAG_INDEX_PATH = Path(os.getenv("RAG_INDEX_PATH", str(DEFAULT_RAG_INDEX_PATH))).expanduser()
+RAG_TOP_K = max(int(os.getenv("RAG_TOP_K", "3")), 1)
 
 
 @dataclass
@@ -114,7 +134,7 @@ class BaseAgent:
         """调用 LLM"""
         try:
             response = client.chat.completions.create(
-                model="deepseek-chat",
+                model=DEEPSEEK_MODEL,
                 messages=[
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -494,7 +514,8 @@ class ActionPlanAgent(BaseAgent):
         super().__init__("ActionPlanAgent", system_prompt)
     
     def generate(self, profile: UserProfile, status_result: Dict,
-                 risk_result: Dict, factor_result: Dict) -> Dict:
+                 risk_result: Dict, factor_result: Dict,
+                 knowledge_context: str = "") -> Dict:
         """生成行动计划"""
         context = f"""
 【用户画像】
@@ -536,6 +557,14 @@ class ActionPlanAgent(BaseAgent):
 4. 活动与营养
 5. 情绪与社交
 6. 照护资源对接
+"""
+        if knowledge_context:
+            context += f"""
+
+【RAG知识库参考】
+以下内容来自项目内置知识库，仅作辅助参考。请结合当前老人的具体情况吸收使用，不要逐字照抄，也不要生成与个体情况矛盾的建议。
+
+{knowledge_context}
 """
         result = self.call_llm(context)
         return self.parse_json(result)
@@ -680,7 +709,7 @@ class ReportAgentV2(BaseAgent):
     def generate_report(self, profile: UserProfile, status_result: Dict,
                         risk_result: Dict, factor_result: Dict,
                         action_result: Dict, priority_result: Dict,
-                        review_result: Dict) -> str:
+                        review_result: Dict, knowledge_context: str = "") -> str:
         """生成最终报告"""
         
         # 检查是否有紧急情况
@@ -768,6 +797,14 @@ C级（第三优先）: {priority_result.get('priority_c', [])}
 ## 5. 温馨寄语
 [一段温暖、鼓励的话，强调"按计划慢慢来，能做多少就做多少"]
 """
+        if knowledge_context:
+            context += f"""
+
+【RAG知识库参考】
+以下材料来自项目知识库，请仅在与当前老人情况一致时吸收为通俗建议，不要照抄原文，也不要引用过于学术化的表述：
+
+{knowledge_context}
+"""
         return self.call_llm(context, temperature=0.5)
 
 
@@ -784,10 +821,24 @@ class OrchestratorAgentV2:
         self.priority_agent = PriorityAgent()
         self.review_agent = ReviewAgent()
         self.report_agent = ReportAgentV2()
+        self.knowledge_agent = self._init_knowledge_agent()
+
+    def _init_knowledge_agent(self):
+        if not RAG_ENABLED or PageIndexRAGAgent is None:
+            return None
+        if not RAG_INDEX_PATH.exists():
+            print(f"⚠️ RAG 已启用，但索引文件不存在: {RAG_INDEX_PATH}")
+            return None
+        try:
+            return PageIndexRAGAgent(index_path=str(RAG_INDEX_PATH))
+        except Exception as error:
+            print(f"⚠️ RAG Agent 初始化失败: {error}")
+            return None
     
     def run(self, profile: UserProfile, verbose: bool = True) -> Dict:
         """执行完整评估流程"""
         results = {}
+        knowledge_context = ""
         
         # Stage 1: 状态判定
         if verbose:
@@ -813,12 +864,34 @@ class OrchestratorAgentV2:
         )
         if verbose:
             print(f"   → 主要问题数: {len(results['factors'].get('main_problems', []))}")
+
+        # Stage 3.5: RAG 知识检索（可选）
+        if self.knowledge_agent is not None:
+            if verbose:
+                print("📚 Stage 3.5: RAG 知识检索 Agent 执行中...")
+            results['knowledge'] = self.knowledge_agent.retrieve_for_profile(
+                profile,
+                results['status'],
+                results['risk'],
+                results['factors'],
+                top_k=RAG_TOP_K,
+            )
+            knowledge_context = results['knowledge'].get('context', '')
+            if verbose:
+                print(f"   → 命中文档片段数: {len(results['knowledge'].get('hits', []))}")
+        else:
+            results['knowledge'] = {
+                "enabled": False,
+                "hits": [],
+                "context": "",
+            }
         
         # Stage 4: 行动计划生成（新增）
         if verbose:
             print("💡 Stage 4: 行动计划 Agent 执行中...")
         results['actions'] = self.action_agent.generate(
-            profile, results['status'], results['risk'], results['factors']
+            profile, results['status'], results['risk'], results['factors'],
+            knowledge_context=knowledge_context,
         )
         if verbose:
             print(f"   → 生成行动数: {len(results['actions'].get('actions', []))}")
@@ -852,7 +925,8 @@ class OrchestratorAgentV2:
         results['report'] = self.report_agent.generate_report(
             profile, results['status'], results['risk'],
             results['factors'], results['actions'],
-            results['priority'], results['review']
+            results['priority'], results['review'],
+            knowledge_context=knowledge_context,
         )
         if verbose:
             print("   → 报告生成完成")
