@@ -23,11 +23,12 @@ env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(env_path)
 
 import uvicorn
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.websockets import WebSocketState
 
 import sys
 
@@ -42,6 +43,7 @@ sys.path.insert(0, str(core_dir))
 from memory.conversation_manager import ConversationManager, SessionState
 from workspace_manager import WorkspaceManager
 from mappers import to_backend_profile, to_frontend_report_data
+from services.google_stt_stream import GoogleSpeechStreamBridge, GoogleSpeechStreamConfig, GoogleSpeechStreamError
 from schemas import (
     AgentStatusEvent,
     ChatMessageRequest,
@@ -66,6 +68,81 @@ conversation_manager: Optional[ConversationManager] = None
 # 全局工作区管理器
 workspace_manager: Optional[WorkspaceManager] = None
 RAG_ENABLED = os.getenv("RAG_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
+
+
+def build_google_speech_config(language_code: Optional[str] = None) -> GoogleSpeechStreamConfig:
+    languages = [
+        item.strip()
+        for item in _env_first(
+            "GOOGLE_SPEECH_LANGUAGE_CODES",
+            "GOOGLE_CLOUD_SPEECH_LANGUAGE_CODES",
+            default="cmn-Hans-CN",
+        ).split(",")
+        if item.strip()
+    ]
+    if language_code:
+        languages = [language_code]
+
+    location = _env_first("GOOGLE_SPEECH_LOCATION", "GOOGLE_CLOUD_SPEECH_LOCATION", default="global")
+    api_endpoint = _env_first("GOOGLE_SPEECH_API_ENDPOINT", "GOOGLE_CLOUD_SPEECH_API_ENDPOINT") or None
+    if api_endpoint is None and location != "global":
+        api_endpoint = f"{location}-speech.googleapis.com"
+
+    return GoogleSpeechStreamConfig(
+        project_id=_env_first("GOOGLE_CLOUD_PROJECT"),
+        location=location,
+        recognizer=_env_first("GOOGLE_SPEECH_RECOGNIZER", "GOOGLE_CLOUD_SPEECH_RECOGNIZER", default="_"),
+        language_codes=languages or ["cmn-Hans-CN"],
+        model=_env_first("GOOGLE_SPEECH_MODEL", "GOOGLE_CLOUD_SPEECH_MODEL", default="chirp_3"),
+        sample_rate_hz=_env_int(
+            "GOOGLE_SPEECH_SAMPLE_RATE_HZ",
+            _env_int("GOOGLE_CLOUD_SPEECH_SAMPLE_RATE_HZ", 16000),
+        ),
+        audio_channel_count=_env_int(
+            "GOOGLE_SPEECH_CHANNEL_COUNT",
+            _env_int("GOOGLE_CLOUD_SPEECH_CHANNEL_COUNT", 1),
+        ),
+        enable_automatic_punctuation=_env_flag("GOOGLE_SPEECH_ENABLE_PUNCTUATION", True),
+        enable_voice_activity_events=_env_flag("GOOGLE_SPEECH_ENABLE_VOICE_ACTIVITY_EVENTS", True),
+        speech_start_timeout_seconds=_env_float("GOOGLE_SPEECH_START_TIMEOUT_SEC", 5.0),
+        speech_end_timeout_seconds=_env_float("GOOGLE_SPEECH_END_TIMEOUT_SEC", 1.8),
+        api_endpoint=api_endpoint,
+    )
 
 
 def save_report(
@@ -573,6 +650,90 @@ async def stream_chat(message: str, sessionId: str):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.websocket("/ws/stt")
+async def stream_speech_to_text(websocket: WebSocket):
+    await websocket.accept()
+
+    bridge: Optional[GoogleSpeechStreamBridge] = None
+    sender_task: Optional[asyncio.Task[None]] = None
+
+    async def send_bridge_events() -> None:
+        assert bridge is not None
+
+        while True:
+            event = await asyncio.to_thread(bridge.next_event, 0.25)
+            if event is None:
+                continue
+
+            await websocket.send_json(event)
+
+            if event.get("type") in {"closed", "error"}:
+                break
+
+    try:
+        start_payload = await websocket.receive_json()
+        if start_payload.get("type") != "start":
+            await websocket.send_json({"type": "error", "message": "Invalid speech start message."})
+            await websocket.close(code=1003)
+            return
+
+        bridge = GoogleSpeechStreamBridge(
+            build_google_speech_config(language_code=start_payload.get("lang"))
+        )
+        bridge.start()
+
+        await websocket.send_json({"type": "ready", "engine": "google_stt_v2"})
+        sender_task = asyncio.create_task(send_bridge_events())
+
+        while True:
+            message = await websocket.receive()
+
+            if message["type"] == "websocket.disconnect":
+                break
+
+            binary_chunk = message.get("bytes")
+            if binary_chunk is not None:
+                bridge.push_audio(binary_chunk)
+                continue
+
+            text_payload = message.get("text")
+            if not text_payload:
+                continue
+
+            try:
+                payload = json.loads(text_payload)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "message": "Invalid speech control message."})
+                break
+
+            if payload.get("type") == "stop":
+                bridge.finish_input()
+                break
+
+        if bridge is not None:
+            bridge.finish_input()
+
+        if sender_task is not None:
+            await sender_task
+    except WebSocketDisconnect:
+        if bridge is not None:
+            bridge.abort()
+    except GoogleSpeechStreamError as exc:
+        if websocket.client_state != WebSocketState.DISCONNECTED:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+            await websocket.close(code=1011)
+    except Exception as exc:
+        if websocket.client_state != WebSocketState.DISCONNECTED:
+            await websocket.send_json({"type": "error", "message": f"Speech stream failed: {exc}"})
+            await websocket.close(code=1011)
+    finally:
+        if bridge is not None:
+            bridge.abort()
+
+        if sender_task is not None and not sender_task.done():
+            sender_task.cancel()
 
 
 # ==================== 报告相关 API ====================
