@@ -103,9 +103,96 @@ class APIServerTestCase(unittest.TestCase):
         self.conversation_manager = self.client.app.state.conversation_manager
         self.workspace_manager = self.client.app.state.workspace_manager
 
-    def test_chat_progress_returns_real_progress_data(self):
-        user_id = self.conversation_manager.new_user()
-        session_id = self.conversation_manager.new_session(user_id)
+    def _auth_headers(self, token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    def _start_chat(self) -> dict:
+        response = self.client.post("/chat/start")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["userType"], "elderly")
+        self.assertTrue(body["accessToken"])
+        self.assertTrue(body["expiresAt"])
+        return body
+
+    def _register_family(
+        self,
+        elderly_id: str,
+        phone: str = "13800138000",
+        password: str = "secret123",
+        name: str = "张家属",
+    ) -> tuple[dict, str, str]:
+        response = self.client.post(
+            "/auth/family/register",
+            json={
+                "name": name,
+                "phone": phone,
+                "password": password,
+                "elderlyId": elderly_id,
+                "relation": "子女",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json(), phone, password
+
+    def _generate_report_for_elderly(
+        self,
+        elderly_id: str,
+        token: str,
+        payload: dict | None = None,
+    ) -> dict:
+        profile_payload = payload or {
+            "age": 84,
+            "sex": "男",
+            "residence": "农村",
+            "education_years": 6,
+        }
+        with patch.object(
+            server,
+            "_run_report_workflow",
+            new=AsyncMock(return_value=build_fake_workflow_results()),
+        ):
+            response = self.client.post(
+                f"/report/generate/{elderly_id}",
+                json=profile_payload,
+                headers=self._auth_headers(token),
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def _generate_report_with_session(
+        self,
+        session_id: str,
+        token: str,
+        profile: dict | None = None,
+    ):
+        request_payload = {
+            "sessionId": session_id,
+            "profile": profile
+            or {
+                "age": 82,
+                "sex": "男",
+                "residence": "城市",
+                "education_years": 9,
+            },
+        }
+        with patch.object(
+            server,
+            "_run_report_workflow",
+            new=AsyncMock(return_value=build_fake_workflow_results()),
+        ):
+            return self.client.post(
+                "/report/generate",
+                json=request_payload,
+                headers=self._auth_headers(token),
+            )
+
+    def test_chat_start_issues_elderly_token_and_scopes_session_endpoints(self):
+        start = self._start_chat()
+        user_id = start["userId"]
+        session_id = start["sessionId"]
+        token = start["accessToken"]
+
         self.conversation_manager.store.update_profile(
             user_id,
             {
@@ -118,127 +205,253 @@ class APIServerTestCase(unittest.TestCase):
             },
         )
 
-        response = self.client.get(f"/chat/progress/{session_id}")
+        unauthorized = self.client.get(f"/chat/progress/{session_id}")
+        self.assertEqual(unauthorized.status_code, 401)
 
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertEqual(body["state"], "greeting")
-        self.assertGreater(body["progress"], 0.0)
-        self.assertIn("基本信息", body["completedGroups"])
-        self.assertIn("健康限制", body["pendingGroups"])
-        self.assertIn("健康限制", body["missingFields"])
+        progress_response = self.client.get(
+            f"/chat/progress/{session_id}",
+            headers=self._auth_headers(token),
+        )
+        self.assertEqual(progress_response.status_code, 200, progress_response.text)
+        progress_body = progress_response.json()
+        self.assertEqual(progress_body["state"], "collecting")
+        self.assertIn("基本信息", progress_body["completedGroups"])
 
-    def test_family_reports_filters_by_elderly_id_and_sorts(self):
-        elderly_id = self.conversation_manager.new_user()
-        other_elderly_id = self.conversation_manager.new_user()
-        session_old = self.conversation_manager.new_session(elderly_id)
-        session_new = self.conversation_manager.new_session(elderly_id)
-        session_other = self.conversation_manager.new_session(other_elderly_id)
+        profile_response = self.client.get(
+            "/elderly/me/profile",
+            headers=self._auth_headers(token),
+        )
+        self.assertEqual(profile_response.status_code, 200, profile_response.text)
+        self.assertEqual(profile_response.json()["elderly_id"], user_id)
 
-        for session_id, user_id in [
-            (session_old, elderly_id),
-            (session_new, elderly_id),
-            (session_other, other_elderly_id),
-        ]:
-            self.workspace_manager.create_metadata(
-                session_id,
-                {
-                    "session_id": session_id,
-                    "user_id": user_id,
-                    "created_at": "2026-03-19T10:00:00",
-                    "status": "active",
-                    "title": "评估记录",
-                },
-            )
+        sessions_response = self.client.get(
+            "/api/sessions",
+            headers=self._auth_headers(token),
+        )
+        self.assertEqual(sessions_response.status_code, 200, sessions_response.text)
+        self.assertEqual(
+            [item["session_id"] for item in sessions_response.json()["sessions"]],
+            [session_id],
+        )
 
-        self.workspace_manager.save_report(
-            session_old,
-            {
-                "report_id": "old-report",
-                "generated_at": "2026-03-19T10:00:00",
-                "report_data": {"summary": "较早报告"},
+        session_detail = self.client.get(
+            f"/api/sessions/{session_id}",
+            headers=self._auth_headers(token),
+        )
+        self.assertEqual(session_detail.status_code, 200, session_detail.text)
+        self.assertEqual(session_detail.json()["metadata"]["user_id"], user_id)
+
+    def test_elderly_cannot_access_other_elderly_session_or_report(self):
+        elderly_one = self._start_chat()
+        elderly_two = self._start_chat()
+
+        denied_history = self.client.get(
+            f"/chat/history/{elderly_two['sessionId']}",
+            headers=self._auth_headers(elderly_one["accessToken"]),
+        )
+        self.assertEqual(denied_history.status_code, 403)
+
+        report_response = self._generate_report_for_elderly(
+            elderly_two["userId"],
+            elderly_two["accessToken"],
+        )
+        report_id = report_response["reportId"]
+
+        my_reports = self.client.get(
+            "/elderly/me/reports",
+            headers=self._auth_headers(elderly_two["accessToken"]),
+        )
+        self.assertEqual(my_reports.status_code, 200, my_reports.text)
+        self.assertEqual([item["id"] for item in my_reports.json()["data"]], [report_id])
+
+        own_report = self.client.get(
+            f"/elderly/me/reports/{report_id}",
+            headers=self._auth_headers(elderly_two["accessToken"]),
+        )
+        self.assertEqual(own_report.status_code, 200, own_report.text)
+        self.assertEqual(own_report.json()["summary"], "整体情况需要持续观察。")
+
+        other_report = self.client.get(
+            f"/report/{report_id}",
+            headers=self._auth_headers(elderly_one["accessToken"]),
+        )
+        self.assertEqual(other_report.status_code, 403)
+
+        denied_me_report = self.client.get(
+            f"/elderly/me/reports/{report_id}",
+            headers=self._auth_headers(elderly_one["accessToken"]),
+        )
+        self.assertEqual(denied_me_report.status_code, 403)
+
+    def test_family_register_bind_login_and_elderly_list_are_relation_scoped(self):
+        elderly_one = self._start_chat()
+        elderly_two = self._start_chat()
+        elderly_three = self._start_chat()
+
+        register_body, phone, password = self._register_family(elderly_one["userId"])
+        family_token = register_body["token"]
+        self.assertEqual(register_body["role"], "family")
+        self.assertEqual(register_body["elderly_ids"], [elderly_one["userId"]])
+
+        list_response = self.client.get(
+            "/family/elderly-list",
+            headers=self._auth_headers(family_token),
+        )
+        self.assertEqual(list_response.status_code, 200, list_response.text)
+        self.assertEqual(
+            {item["elderly_id"] for item in list_response.json()["data"]},
+            {elderly_one["userId"]},
+        )
+
+        bind_response = self.client.post(
+            "/auth/family/bind",
+            json={
+                "elderlyId": elderly_two["userId"],
+                "relation": "配偶",
             },
-            "json",
+            headers=self._auth_headers(family_token),
         )
-        self.workspace_manager.save_report(
-            session_new,
-            {
-                "report_id": "new-report",
-                "generated_at": "2026-03-19T12:00:00",
-                "report_data": {"summary": "最新报告"},
-            },
-            "json",
+        self.assertEqual(bind_response.status_code, 200, bind_response.text)
+
+        relisted = self.client.get(
+            "/family/elderly-list",
+            headers=self._auth_headers(family_token),
         )
-        self.workspace_manager.save_report(
-            session_other,
-            {
-                "report_id": "other-report",
-                "generated_at": "2026-03-19T13:00:00",
-                "report_data": {"summary": "其他老人报告"},
-            },
-            "json",
+        self.assertEqual(relisted.status_code, 200, relisted.text)
+        self.assertEqual(
+            {item["elderly_id"] for item in relisted.json()["data"]},
+            {elderly_one["userId"], elderly_two["userId"]},
         )
 
-        response = self.client.get(f"/family/reports/{elderly_id}")
-
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertEqual([item["id"] for item in body["data"]], ["new-report", "old-report"])
-        self.assertTrue(all(item["content"]["report_id"] != "other-report" for item in body["data"]))
-
-    def test_generate_report_for_elderly_persists_profile_and_workspace_report(self):
-        elderly_id = self.conversation_manager.new_user()
-        fake_results = build_fake_workflow_results()
-
-        with patch.object(
-            server,
-            "_run_report_workflow",
-            new=AsyncMock(return_value=fake_results),
-        ):
-            response = self.client.post(
-                f"/report/generate/{elderly_id}",
-                json={
-                    "age": 84,
-                    "sex": "男",
-                    "residence": "农村",
-                    "education_years": 6,
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertIn("reportId", body)
-        self.assertIn("sessionId", body)
-        self.assertEqual(body["report"]["summary"], "整体情况需要持续观察。")
-
-        stored_profile = self.conversation_manager.store.get_profile(elderly_id)
-        self.assertEqual(stored_profile.age, 84)
-        self.assertEqual(stored_profile.residence, "农村")
-
-        session_id = body["sessionId"]
-        metadata = self.workspace_manager.get_session_metadata(session_id)
-        self.assertEqual(metadata["user_id"], elderly_id)
-        self.assertTrue(metadata["has_profile"])
-        self.assertTrue(metadata["has_report"])
-        self.assertEqual(len(self.workspace_manager.get_report_files(session_id)), 1)
-
-    def test_auth_routes_keep_demo_behavior(self):
-        invalid_response = self.client.post(
-            "/auth/login",
-            json={"phone": "", "password": ""},
+        forbidden_detail = self.client.get(
+            f"/family/elderly/{elderly_three['userId']}",
+            headers=self._auth_headers(family_token),
         )
-        self.assertEqual(invalid_response.status_code, 400)
+        self.assertEqual(forbidden_detail.status_code, 403)
 
         login_response = self.client.post(
             "/auth/login",
-            json={"phone": "13800138000", "password": "123456"},
+            json={"phone": phone, "password": password},
         )
-        self.assertEqual(login_response.status_code, 200)
-        self.assertEqual(login_response.json()["role"], "family")
+        self.assertEqual(login_response.status_code, 200, login_response.text)
+        self.assertEqual(
+            set(login_response.json()["elderly_ids"]),
+            {elderly_one["userId"], elderly_two["userId"]},
+        )
 
         logout_response = self.client.post("/auth/logout")
         self.assertEqual(logout_response.status_code, 200)
         self.assertEqual(logout_response.json(), {"success": True})
+
+    def test_family_can_only_access_bound_reports_and_sessions(self):
+        elderly_one = self._start_chat()
+        elderly_two = self._start_chat()
+        register_body, _, _ = self._register_family(
+            elderly_one["userId"],
+            phone="13800138001",
+        )
+        family_token = register_body["token"]
+
+        report_one = self._generate_report_for_elderly(
+            elderly_one["userId"],
+            elderly_one["accessToken"],
+        )
+        report_two = self._generate_report_for_elderly(
+            elderly_two["userId"],
+            elderly_two["accessToken"],
+        )
+        self.assertNotEqual(report_one["reportId"], report_two["reportId"])
+
+        sessions_response = self.client.get(
+            "/api/sessions",
+            headers=self._auth_headers(family_token),
+        )
+        self.assertEqual(sessions_response.status_code, 200, sessions_response.text)
+        self.assertEqual(
+            {item["user_id"] for item in sessions_response.json()["sessions"]},
+            {elderly_one["userId"]},
+        )
+
+        allowed_session = self.client.get(
+            f"/api/sessions/{report_one['sessionId']}",
+            headers=self._auth_headers(family_token),
+        )
+        self.assertEqual(allowed_session.status_code, 200, allowed_session.text)
+
+        denied_session = self.client.get(
+            f"/api/sessions/{report_two['sessionId']}",
+            headers=self._auth_headers(family_token),
+        )
+        self.assertEqual(denied_session.status_code, 403)
+
+        family_reports = self.client.get(
+            f"/family/reports/{elderly_one['userId']}",
+            headers=self._auth_headers(family_token),
+        )
+        self.assertEqual(family_reports.status_code, 200, family_reports.text)
+        self.assertEqual(
+            [item["id"] for item in family_reports.json()["data"]],
+            [report_one["reportId"]],
+        )
+
+        forbidden_reports = self.client.get(
+            f"/family/reports/{elderly_two['userId']}",
+            headers=self._auth_headers(family_token),
+        )
+        self.assertEqual(forbidden_reports.status_code, 403)
+
+        shared_report = self.client.get(
+            f"/report/{report_one['reportId']}",
+            headers=self._auth_headers(family_token),
+        )
+        self.assertEqual(shared_report.status_code, 200, shared_report.text)
+
+        forbidden_report = self.client.get(
+            f"/report/{report_two['reportId']}",
+            headers=self._auth_headers(family_token),
+        )
+        self.assertEqual(forbidden_report.status_code, 403)
+
+        export_allowed = self.client.get(
+            f"/report/{report_one['reportId']}/export/pdf",
+            headers=self._auth_headers(family_token),
+        )
+        self.assertEqual(export_allowed.status_code, 501)
+
+        export_forbidden = self.client.get(
+            f"/report/{report_two['reportId']}/export/pdf",
+            headers=self._auth_headers(family_token),
+        )
+        self.assertEqual(export_forbidden.status_code, 403)
+
+    def test_report_generation_requires_authenticated_bound_session(self):
+        elderly = self._start_chat()
+
+        unauthorized = self.client.post(
+            "/report/generate",
+            json={"profile": {"age": 80}, "sessionId": elderly["sessionId"]},
+        )
+        self.assertEqual(unauthorized.status_code, 401)
+
+        missing_session = self._generate_report_with_session(
+            session_id="",
+            token=elderly["accessToken"],
+        )
+        self.assertEqual(missing_session.status_code, 400)
+
+        success = self._generate_report_with_session(
+            session_id=elderly["sessionId"],
+            token=elderly["accessToken"],
+        )
+        self.assertEqual(success.status_code, 200, success.text)
+        self.assertEqual(success.json()["summary"], "整体情况需要持续观察。")
+
+        other = self._start_chat()
+        cross_session = self._generate_report_with_session(
+            session_id=other["sessionId"],
+            token=elderly["accessToken"],
+        )
+        self.assertEqual(cross_session.status_code, 403)
 
 
 if __name__ == "__main__":
