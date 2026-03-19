@@ -65,7 +65,18 @@ class ReportData(BaseModel):
     generatedAt: str
 
 
+class ReportGenerateByElderlyResponse(BaseModel):
+    reportId: str
+    sessionId: str
+    report: ReportData
+
+
 class AgentStatusEvent(BaseModel):
     agent: str
     status: str
     message: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    phone: str
+    password: str
