@@ -490,17 +490,34 @@ class ConversationManager:
     def _build_greeting_reply(self, missing: Dict[str, list], group_idx: int) -> str:
         """构造初始欢迎语 + 第一组问题"""
         first_group = QUESTION_GROUPS[group_idx]
-        total_groups = len(QUESTION_GROUPS)
+        
+        # 获取第一个问题（支持 question 或 questions[0]）
+        first_question = self._get_group_question(first_group, 0)
 
         greeting = (
-            "您好！我是AI养老健康助手😊\n\n"
-            "为了给您（或家中老人）生成一份个性化的健康评估报告，"
-            f"我需要了解一些基本情况，一共分{total_groups}个部分，"
-            "每部分几个问题，您可以用自己的话来回答，不用太正式。\n\n"
-            f"**第1部分：{first_group['group_name']}**\n\n"
-            f"{first_group['question']}"
+            "您好😊 我想先了解一下您的日常身体和生活情况，这样才能给您整理一份更贴合您实际情况的健康建议。\n\n"
+            "我会一步一步来问，都是些日常问题，您按平时说话的方式回答就行。要是有些记不清，也没关系，大概说一下就可以。\n\n"
+            f"{first_question}"
         )
         return greeting
+    
+    def _get_group_question(self, group: Dict, question_idx: int = 0) -> str:
+        """
+        获取分组的问题文本
+        支持两种格式：
+        1. 单个 question 字段（旧格式）
+        2. 多个 questions 列表（新格式，支持多轮提问）
+        """
+        if "questions" in group and isinstance(group["questions"], list):
+            # 新格式：多轮问题
+            if question_idx < len(group["questions"]):
+                return group["questions"][question_idx]
+            else:
+                # 如果索引超出范围，返回最后一个问题
+                return group["questions"][-1] if group["questions"] else ""
+        else:
+            # 旧格式：单个问题
+            return group.get("question", "")
 
     def _build_followup_reply(
         self, user_id: str, missing: Dict[str, list],
@@ -523,12 +540,38 @@ class ConversationManager:
             f"字段完成率 {self.store.get_completion_rate(user_id)*100:.0f}%）\n\n"
         )
 
+        # 检查最后一条用户消息是否表示"记不清"
+        if history:
+            last_user_msg = ""
+            for msg in reversed(history):
+                if msg["role"] == "user":
+                    last_user_msg = msg["content"].lower()
+                    break
+            
+            # 如果用户表示记不清，跳过这个分组
+            skip_keywords = ["记不清", "忘记", "不知道", "不记得", "没印象", "应该没有", "也没有", "不太清楚"]
+            if any(kw in last_user_msg for kw in skip_keywords):
+                # 跳过当前分组，标记为已处理
+                for field in group["fields"]:
+                    self.store.update_profile(user_id, {field: "未提供"})
+                
+                # 移到下一个分组
+                next_group_idx = group_idx + 1
+                if next_group_idx < len(QUESTION_GROUPS):
+                    next_group = QUESTION_GROUPS[next_group_idx]
+                    next_question = self._get_group_question(next_group, 0)
+                    next_title = f"**第{next_group_idx+1}部分：{next_group['group_name']}**\n\n"
+                    return progress_hint + next_title + next_question
+                else:
+                    # 所有分组都完成了
+                    return self._ready_to_confirm(user_id)[0]
+
         # 检查这个分组是否有部分字段已填，只问缺的那些
         group_missing = [f for f in group["fields"] if f in (missing.get(group["group_name"], []))]
 
         if len(group_missing) == len(group["fields"]):
-            # 整个分组都是空的，用完整问题模板
-            question = group["question"]
+            # 整个分组都是空的，用完整问题模板（第一个问题）
+            question = self._get_group_question(group, 0)
         else:
             # 只有部分字段缺失，动态生成追问
             question = self.extractor.generate_followup(

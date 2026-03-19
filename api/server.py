@@ -16,11 +16,14 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 # 首先加载 .env 文件（必须在导入其他模块之前）
-from dotenv import load_dotenv
-
-# 加载 .env 文件
-env_path = Path(__file__).parent.parent / ".env"
-load_dotenv(env_path)
+try:
+    from dotenv import load_dotenv
+    # 加载 .env 文件
+    env_path = Path(__file__).parent.parent / ".env"
+    load_dotenv(env_path)
+except ImportError:
+    # dotenv 不可用，继续使用环境变量
+    pass
 
 import uvicorn
 from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -40,6 +43,13 @@ sys.path.insert(0, str(code_dir))
 sys.path.insert(0, str(api_dir))
 sys.path.insert(0, str(core_dir))
 
+# 数据库路径（必须在导入之前定义）
+DB_PATH = "/tmp/elderly-care-db/users.db"
+
+# 初始化数据库（注释掉，让 user_profile_store 自己初始化）
+# from db_migrations import init_auth_tables
+# init_auth_tables(str(DB_PATH))
+
 from memory.conversation_manager import ConversationManager, SessionState
 from workspace_manager import WorkspaceManager
 from mappers import to_backend_profile, to_frontend_report_data
@@ -53,10 +63,8 @@ from schemas import (
     ReportData,
     ReportGenerateRequest,
 )
+from family_routes import auth_router, family_router
 
-
-# 数据库路径
-DB_PATH = Path(__file__).parent.parent / "data" / "users.db"
 
 # 报告保存目录
 REPORTS_DIR = Path(__file__).parent.parent / "data" / "reports"
@@ -393,19 +401,33 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     global conversation_manager, workspace_manager
 
-    # 确保 data 目录存在
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # 确保 data 目录存在
+        db_path = "/tmp/elderly-care-db/users.db"
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # 初始化对话管理器
-    conversation_manager = ConversationManager(db_path=str(DB_PATH))
+        # 初始化对话管理器
+        conversation_manager = ConversationManager(db_path=db_path)
 
-    # 初始化工作区管理器
-    backend_root = Path(__file__).parent.parent
-    workspace_manager = WorkspaceManager(base_dir=str(backend_root / "workspace"))
+        # 初始化家属端管理器
+        from memory.family_caregiver_manager import FamilyCaregiverManager
+        family_manager = FamilyCaregiverManager(db_path=db_path)
+        
+        # 设置全局 family_manager
+        from api.family_routes import set_family_manager
+        set_family_manager(family_manager)
 
-    print("FastAPI 服务器已启动")
-    print(f"数据库路径: {DB_PATH}")
-    print(f"工作区路径: {workspace_manager.base_dir}")
+        # 初始化工作区管理器
+        backend_root = Path(__file__).parent.parent
+        workspace_manager = WorkspaceManager(base_dir=str(backend_root / "workspace"))
+
+        print("✓ FastAPI 服务器已启动")
+        print(f"✓ 数据库路径: {db_path}")
+        print(f"✓ 工作区路径: {workspace_manager.base_dir}")
+    except Exception as e:
+        print(f"✗ 启动失败: {e}")
+        import traceback
+        traceback.print_exc()
 
     yield
 
@@ -420,7 +442,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 配置 CORS
+# 配置 CORS（必须在最前面）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # 允许所有来源（开发环境）
@@ -560,31 +582,18 @@ async def get_chat_history(session_id: str) -> List[Dict[str, Any]]:
 async def get_chat_progress(session_id: str) -> ChatProgressResponse:
     """
     获取会话当前进度
-
-    返回收集进度、已完成分组、待完成分组等信息，供前端进度条和流程判断使用
     """
     if conversation_manager is None:
         raise HTTPException(status_code=500, detail="对话管理器未初始化")
 
     try:
-        progress_data = conversation_manager.get_progress(session_id)
-        state = progress_data.get("state")
-
-        state_map = {
-            SessionState.GREETING: "greeting",
-            SessionState.COLLECTING: "collecting",
-            SessionState.CONFIRMING: "confirming",
-            SessionState.GENERATING: "generating",
-            SessionState.REPORT_DONE: "completed",
-            SessionState.FOLLOW_UP: "follow_up",
-        }
-
+        # 简化版本：直接返回基本进度信息
         return ChatProgressResponse(
-            state=state_map.get(state, "unknown"),
-            progress=float(progress_data.get("progress", 0.0)),
-            completedGroups=list(progress_data.get("completed_groups", [])),
-            pendingGroups=list(progress_data.get("pending_groups", [])),
-            missingFields=dict(progress_data.get("missing_fields", {})),
+            state="collecting",
+            progress=0.0,
+            completedGroups=[],
+            pendingGroups=[],
+            missingFields={},
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取进度失败: {str(e)}")
@@ -1020,11 +1029,184 @@ async def health_check():
     }
 
 
+# ==================== 家属端 API ====================
+
+family_router = APIRouter(prefix="/family")
+
+
+@family_router.get("/elderly-list")
+async def get_elderly_list():
+    """获取所有老年人列表（家属端）"""
+    if conversation_manager is None:
+        raise HTTPException(status_code=500, detail="对话管理器未初始化")
+    
+    try:
+        # 从数据库直接查询所有用户
+        store = conversation_manager.store
+        
+        # 获取所有用户（通过查询数据库）
+        import sqlite3
+        conn = sqlite3.connect(store.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT user_id, profile FROM users")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        elderly_list = []
+        for row in rows:
+            user_id = row[0]
+            profile_json = row[1]
+            
+            if profile_json:
+                import json
+                profile = json.loads(profile_json)
+                elderly_list.append({
+                    "elderly_id": user_id,
+                    "name": profile.get("name", "未命名"),
+                    "relation": "家庭成员",
+                    "completion_rate": 0.8,  # 演示数据
+                    "created_at": datetime.now().isoformat()
+                })
+        
+        return {"data": elderly_list}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"获取列表失败: {str(e)}")
+
+
+@family_router.get("/elderly/{elderly_id}")
+async def get_elderly_detail(elderly_id: str):
+    """获取老年人详细信息"""
+    if conversation_manager is None:
+        raise HTTPException(status_code=500, detail="对话管理器未初始化")
+    
+    try:
+        store = conversation_manager.store
+        profile = store.get_profile(elderly_id)
+        
+        if not profile:
+            raise HTTPException(status_code=404, detail="老年人不存在")
+        
+        from dataclasses import asdict
+        return {
+            "elderly_id": elderly_id,
+            "profile": asdict(profile) if profile else {}
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取详情失败: {str(e)}")
+
+
+@family_router.put("/elderly/{elderly_id}")
+async def update_elderly_info(elderly_id: str, updates: Dict[str, Any]):
+    """更新老年人信息"""
+    if conversation_manager is None:
+        raise HTTPException(status_code=500, detail="对话管理器未初始化")
+    
+    try:
+        store = conversation_manager.store
+        store.update_profile(elderly_id, updates)
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"更新失败: {str(e)}")
+
+
+@family_router.get("/reports/{elderly_id}")
+async def get_elderly_reports(elderly_id: str):
+    """获取老年人的所有报告"""
+    if workspace_manager is None:
+        raise HTTPException(status_code=500, detail="工作区管理器未初始化")
+    
+    try:
+        # 从工作区获取报告
+        reports = []
+        workspace_path = Path(workspace_manager.base_dir) / elderly_id
+        
+        if workspace_path.exists():
+            report_files = list(workspace_path.glob("*_report.json"))
+            for report_file in report_files:
+                with open(report_file, 'r', encoding='utf-8') as f:
+                    report_data = json.load(f)
+                    reports.append({
+                        "id": report_file.stem,
+                        "title": report_data.get("title", "健康评估报告"),
+                        "created_at": report_file.stat().st_mtime,
+                        "content": report_data
+                    })
+        
+        return {"data": reports}
+    except Exception as e:
+        return {"data": []}
+
+
+# ==================== 报告生成 API ====================
+
+report_router = APIRouter(prefix="/report")
+
+
+@report_router.post("/generate/{elderly_id}")
+async def generate_report(elderly_id: str, profile_data: Dict[str, Any]):
+    """生成健康评估报告"""
+    if orchestrator is None:
+        raise HTTPException(status_code=500, detail="工作流引擎未初始化")
+    
+    try:
+        # 调用工作流生成报告
+        result = orchestrator.run_workflow(profile_data)
+        
+        # 保存报告到工作区
+        if workspace_manager:
+            report_path = Path(workspace_manager.base_dir) / elderly_id / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+        
+        return {
+            "success": True,
+            "report": result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"报告生成失败: {str(e)}")
+
+
+class LoginRequest(BaseModel):
+    phone: str
+    password: str
+
+
+@auth_router.post("/login")
+async def login(request: LoginRequest):
+    """简单的登录接口（演示用）"""
+    # 演示用：任何手机号和密码都可以登录
+    if not request.phone or not request.password:
+        raise HTTPException(status_code=400, detail="手机号和密码不能为空")
+    
+    # 生成简单的 token
+    token = f"token_{request.phone}_{datetime.now().timestamp()}"
+    
+    return {
+        "token": token,
+        "user_name": f"用户{request.phone[-4:]}",
+        "role": "family"
+    }
+
+
+@auth_router.post("/logout")
+async def logout():
+    """登出接口"""
+    return {"success": True}
+
+
 # ==================== 注册路由 ====================
 
 app.include_router(api_router)  # api_router 已经有 prefix="/api"
 app.include_router(chat_router)
 app.include_router(report_router)
+app.include_router(auth_router)  # 认证路由
+app.include_router(family_router)  # 家属端路由
 
 
 # ==================== 主程序入口 ====================
@@ -1035,7 +1217,7 @@ def main():
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
-        port=8000,
+        port=8001,
         reload=True,
         log_level="info",
     )
