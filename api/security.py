@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
-from auth_service import ELDERLY_ROLE, FAMILY_ROLE, AuthActor
+from auth_service import DOCTOR_ROLE, ELDERLY_ROLE, FAMILY_ROLE, AuthActor
 
 
 def require_state(request: Request, attr: str, error_message: str):
@@ -50,6 +50,13 @@ def require_family_actor(request: Request) -> AuthActor:
     return actor
 
 
+def require_doctor_actor(request: Request) -> AuthActor:
+    actor = require_authenticated_actor(request)
+    if actor.role != DOCTOR_ROLE:
+        raise HTTPException(status_code=403, detail="仅医生账号可访问")
+    return actor
+
+
 def _get_session_owner_user_id(request: Request, session_id: str) -> str:
     conversation_manager = require_state(request, "conversation_manager", "对话管理器未初始化")
     session = conversation_manager.store.get_session(session_id)
@@ -58,8 +65,10 @@ def _get_session_owner_user_id(request: Request, session_id: str) -> str:
     return session["user_id"]
 
 
-def ensure_actor_can_access_user(request: Request, elderly_user_id: str) -> AuthActor:
+def ensure_actor_can_view_user(request: Request, elderly_user_id: str) -> AuthActor:
     actor = require_authenticated_actor(request)
+    if actor.role == DOCTOR_ROLE:
+        return actor
     if actor.role == ELDERLY_ROLE:
         if actor.subject_id != elderly_user_id:
             raise HTTPException(status_code=403, detail="无权访问该老年人数据")
@@ -71,10 +80,24 @@ def ensure_actor_can_access_user(request: Request, elderly_user_id: str) -> Auth
     return actor
 
 
-def ensure_actor_can_access_session(request: Request, session_id: str) -> tuple[AuthActor, str]:
+def ensure_actor_can_view_session(request: Request, session_id: str) -> tuple[AuthActor, str]:
     owner_user_id = _get_session_owner_user_id(request, session_id)
-    actor = ensure_actor_can_access_user(request, owner_user_id)
+    actor = ensure_actor_can_view_user(request, owner_user_id)
     return actor, owner_user_id
+
+
+def ensure_actor_can_access_user(request: Request, elderly_user_id: str) -> AuthActor:
+    actor = require_authenticated_actor(request)
+    if actor.role == DOCTOR_ROLE:
+        raise HTTPException(status_code=403, detail="医生账号仅支持只读访问")
+    return ensure_actor_can_view_user(request, elderly_user_id)
+
+
+def ensure_actor_can_access_session(request: Request, session_id: str) -> tuple[AuthActor, str]:
+    actor = require_authenticated_actor(request)
+    if actor.role == DOCTOR_ROLE:
+        raise HTTPException(status_code=403, detail="医生账号仅支持只读访问")
+    return ensure_actor_can_view_session(request, session_id)
 
 
 def require_family_elderly_access(request: Request, elderly_user_id: str) -> AuthActor:

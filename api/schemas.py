@@ -96,6 +96,7 @@ class AgentStatusEvent(BaseModel):
 class LoginRequest(BaseModel):
     phone: str
     password: str
+    role: str = "family"
 
 
 class AuthResponse(BaseModel):

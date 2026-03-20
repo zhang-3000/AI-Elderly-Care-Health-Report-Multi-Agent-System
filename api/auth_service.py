@@ -8,6 +8,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sqlite3
 import uuid
@@ -19,6 +20,7 @@ from typing import Any, Dict, Optional
 
 FAMILY_ROLE = "family"
 ELDERLY_ROLE = "elderly"
+DOCTOR_ROLE = "doctor"
 
 
 @dataclass(frozen=True)
@@ -124,12 +126,13 @@ class TokenService:
 
 
 class AuthService:
-    """家属账号、绑定关系与 token 管理。"""
+    """家属账号、医生账号、绑定关系与 token 管理。"""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.token_service = TokenService(Path(db_path).parent / ".access_token_secret")
         self._init_db()
+        self._init_default_doctor_account()
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -142,6 +145,18 @@ class AuthService:
                 """
                 CREATE TABLE IF NOT EXISTS family_accounts (
                     family_id TEXT PRIMARY KEY,
+                    phone TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS doctor_accounts (
+                    doctor_id TEXT PRIMARY KEY,
                     phone TEXT NOT NULL UNIQUE,
                     name TEXT NOT NULL,
                     password_hash TEXT NOT NULL,
@@ -167,6 +182,9 @@ class AuthService:
                 "CREATE INDEX IF NOT EXISTS idx_family_accounts_phone ON family_accounts(phone)"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_doctor_accounts_phone ON doctor_accounts(phone)"
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_family_relation_family ON family_elderly_relation(family_id)"
             )
             conn.execute(
@@ -176,6 +194,41 @@ class AuthService:
     @staticmethod
     def _hash_password(password: str) -> str:
         return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+    def _init_default_doctor_account(self) -> None:
+        name = (os.getenv("DOCTOR_DEFAULT_NAME") or "").strip()
+        phone = (os.getenv("DOCTOR_DEFAULT_PHONE") or "").strip()
+        password = (os.getenv("DOCTOR_DEFAULT_PASSWORD") or "").strip()
+        if not all([name, phone, password]):
+            return
+
+        password_hash = self._hash_password(password)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT doctor_id, created_at FROM doctor_accounts WHERE phone = ?",
+                (phone,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO doctor_accounts (
+                        doctor_id, phone, name, password_hash, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (str(uuid.uuid4()), phone, name, password_hash, now, now),
+                )
+                return
+
+            conn.execute(
+                """
+                UPDATE doctor_accounts
+                SET name = ?, password_hash = ?, updated_at = ?
+                WHERE phone = ?
+                """,
+                (name, password_hash, now, phone),
+            )
 
     def _elderly_exists(self, elderly_user_id: str) -> bool:
         with self._conn() as conn:
@@ -191,6 +244,9 @@ class AuthService:
     def issue_family_token(self, family_id: str, expires_in_days: int = 30) -> IssuedToken:
         return self.token_service.issue(family_id, FAMILY_ROLE, expires_in_days)
 
+    def issue_doctor_token(self, doctor_id: str, expires_in_days: int = 30) -> IssuedToken:
+        return self.token_service.issue(doctor_id, DOCTOR_ROLE, expires_in_days)
+
     def verify_access_token(self, token: str) -> Optional[AuthActor]:
         return self.token_service.verify(token)
 
@@ -203,6 +259,18 @@ class AuthService:
                 WHERE family_id = ?
                 """,
                 (family_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_doctor_account(self, doctor_id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT doctor_id, phone, name, created_at, updated_at
+                FROM doctor_accounts
+                WHERE doctor_id = ?
+                """,
+                (doctor_id,),
             ).fetchone()
         return dict(row) if row is not None else None
 
@@ -331,6 +399,32 @@ class AuthService:
             token=issued_token,
         )
 
+    def authenticate_doctor(
+        self,
+        phone: str,
+        password: str,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        password_hash = self._hash_password(password)
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT doctor_id, phone, name
+                FROM doctor_accounts
+                WHERE phone = ? AND password_hash = ?
+                """,
+                (phone, password_hash),
+            ).fetchone()
+
+        if row is None:
+            return False, "手机号或密码错误", None
+
+        issued_token = self.issue_doctor_token(row["doctor_id"])
+        return True, "登录成功", self._build_doctor_auth_payload(
+            doctor_id=row["doctor_id"],
+            name=row["name"],
+            token=issued_token,
+        )
+
     def _build_family_auth_payload(
         self,
         family_id: str,
@@ -345,4 +439,18 @@ class AuthService:
             "user_name": name,
             "role": FAMILY_ROLE,
             "elderly_ids": elderly_ids,
+        }
+
+    def _build_doctor_auth_payload(
+        self,
+        doctor_id: str,
+        name: str,
+        token: IssuedToken,
+    ) -> Dict[str, Any]:
+        return {
+            "token": token.token,
+            "expires_at": token.expires_at,
+            "user_name": name,
+            "role": DOCTOR_ROLE,
+            "elderly_ids": [],
         }

@@ -36,7 +36,8 @@ sys.path.insert(0, str(api_dir))
 sys.path.insert(0, str(core_dir))
 
 from auth_routes import auth_router
-from auth_service import AuthService, ELDERLY_ROLE
+from auth_service import AuthService, DOCTOR_ROLE, ELDERLY_ROLE
+from doctor_routes import doctor_router
 from elderly_routes import elderly_router
 from family_routes import family_router
 from mappers import to_backend_profile, to_frontend_report_data
@@ -62,6 +63,7 @@ from schemas import (
 from security import (
     ensure_actor_can_access_session,
     ensure_actor_can_access_user,
+    ensure_actor_can_view_session,
     require_authenticated_actor,
     require_elderly_session_access,
     require_state,
@@ -239,7 +241,9 @@ async def _run_report_workflow(
     return await asyncio.to_thread(conversation_manager.orchestrator.run, profile, False)
 
 
-def _visible_user_ids_for_actor(request: Request, actor) -> set[str]:
+def _visible_user_ids_for_actor(request: Request, actor) -> Optional[set[str]]:
+    if actor.role == DOCTOR_ROLE:
+        return None
     if actor.role == ELDERLY_ROLE:
         return {actor.subject_id}
     auth_service = require_state(request, "auth_service", "认证服务未初始化")
@@ -258,7 +262,8 @@ def _load_accessible_report_payload(request: Request, report_id: str) -> Dict[st
     if owner_id is None:
         raise HTTPException(status_code=404, detail="报告归属缺失")
 
-    if owner_id not in _visible_user_ids_for_actor(request, actor):
+    visible_user_ids = _visible_user_ids_for_actor(request, actor)
+    if visible_user_ids is not None and owner_id not in visible_user_ids:
         raise HTTPException(status_code=403, detail="无权访问该报告")
     return payload
 
@@ -844,7 +849,7 @@ async def list_sessions(request: Request):
     sessions_metadata = []
     for session_id in workspace_manager.list_sessions():
         metadata = workspace_manager.get_session_metadata(session_id)
-        if metadata and metadata.get("user_id") in visible_user_ids:
+        if metadata and (visible_user_ids is None or metadata.get("user_id") in visible_user_ids):
             sessions_metadata.append(metadata)
     sessions_metadata.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return {"sessions": sessions_metadata}
@@ -853,7 +858,7 @@ async def list_sessions(request: Request):
 @api_router.get("/sessions/{session_id}")
 async def get_session(request: Request, session_id: str):
     """获取当前主体可见的指定会话数据。"""
-    _, owner_user_id = ensure_actor_can_access_session(request, session_id)
+    _, owner_user_id = ensure_actor_can_view_session(request, session_id)
     workspace_manager = require_state(request, "workspace_manager", "工作区管理器未初始化")
 
     metadata = workspace_manager.get_session_metadata(session_id)
@@ -917,6 +922,7 @@ app.include_router(report_router)
 app.include_router(auth_router)
 app.include_router(family_router)
 app.include_router(elderly_router)
+app.include_router(doctor_router)
 
 
 def main():

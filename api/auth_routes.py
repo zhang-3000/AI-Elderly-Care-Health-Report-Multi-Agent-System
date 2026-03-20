@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
 
+from auth_service import DOCTOR_ROLE, FAMILY_ROLE
 from schemas import AuthResponse, FamilyBindRequest, FamilyRegisterRequest, LoginRequest
 from security import require_family_actor, require_state
 
@@ -55,15 +56,25 @@ async def bind_family_to_elderly(request: Request, payload: FamilyBindRequest):
 
 @auth_router.post("/login", response_model=AuthResponse)
 async def login(request: Request, payload: LoginRequest) -> AuthResponse:
-    """家属真实登录接口。"""
+    """按角色执行真实登录。"""
     auth_service = require_state(request, "auth_service", "认证服务未初始化")
     if not payload.phone.strip() or not payload.password.strip():
         raise HTTPException(status_code=400, detail="手机号和密码不能为空")
 
-    success, message, data = auth_service.authenticate_family(
-        payload.phone.strip(),
-        payload.password.strip(),
-    )
+    role = (payload.role or FAMILY_ROLE).strip().lower()
+    if role == FAMILY_ROLE:
+        success, message, data = auth_service.authenticate_family(
+            payload.phone.strip(),
+            payload.password.strip(),
+        )
+    elif role == DOCTOR_ROLE:
+        success, message, data = auth_service.authenticate_doctor(
+            payload.phone.strip(),
+            payload.password.strip(),
+        )
+    else:
+        raise HTTPException(status_code=400, detail="不支持的登录角色")
+
     if not success or data is None:
         raise HTTPException(status_code=401, detail=message)
     return AuthResponse(**data)
