@@ -12,7 +12,7 @@
 2. 基于多 Agent 的报告生成
 3. 会话工作区管理
 4. 家属账号注册、登录与老人绑定
-5. 医生账号登录与全量老人只读总览
+5. 医生账号登录、全量老人总览与随访管理
 6. 基于 token 的访问控制
 7. 语音流式转文字
 
@@ -130,7 +130,7 @@ Authorization: Bearer <family-token>
 - 老人 token 只能访问自己的会话、画像、报告。
 - 家属 token 只能访问与当前家属绑定的老人数据。
 - 医生 token 可读取全部老人、全部会话、全部报告。
-- 医生 token 不可修改画像、删除会话、生成报告。
+- 医生 token 可维护医生侧随访记录和管理状态，但不可修改画像、删除会话、生成报告。
 - `GET /report/{report_id}`、`GET /api/sessions/{session_id}` 等接口都会按报告/会话归属做校验。
 - `POST /report/generate` 与 `POST /report/stream` 现在必须提供 `sessionId`，避免生成无归属报告。
 
@@ -161,6 +161,9 @@ Authorization: Bearer <family-token>
 - `POST /auth/logout`
 - `GET /doctor/elderly-list`
 - `GET /doctor/elderly/{elderly_id}`
+- `GET /doctor/elderly/{elderly_id}/followups`
+- `POST /doctor/elderly/{elderly_id}/followups`
+- `PATCH /doctor/elderly/{elderly_id}/management`
 - `POST /family/session/start/{elderly_id}`
 - `POST /family/session/{session_id}/message`
 - `GET /family/session/{session_id}/info`
@@ -224,6 +227,9 @@ Authorization: Bearer <family-token>
 
 - `GET /doctor/elderly-list`
 - `GET /doctor/elderly/{elderly_id}`
+- `GET /doctor/elderly/{elderly_id}/followups`
+- `POST /doctor/elderly/{elderly_id}/followups`
+- `PATCH /doctor/elderly/{elderly_id}/management`
 
 ## 5. 接口说明
 
@@ -544,6 +550,31 @@ Authorization: Bearer <family-token>
 - `report_count`
 - `latest_session_id`
 - `latest_report_id`
+- `overview`
+- `management`
+- `latest_followup`
+
+其中 `overview` 为医生端派生摘要，不会改写老人原始画像，当前包含：
+
+- `chronic_conditions`
+- `current_risk_level`
+- `functional_status_level`
+- `risk_tags`
+- `recent_change`
+- `main_problems`
+- `high_risk_reasons`
+- `recommended_actions`
+- `latest_report_review`
+
+`latest_report_review` 来自最新报告的复核结果，当前会聚合：
+
+- 一致性检查结果与问题列表
+- 安全性提示
+- 可执行性检查
+- 完整性检查
+- 总体质量与建议
+
+`management` 与 `latest_followup` 为医生端独立管理数据，只保存在医生侧表中，不会回写老人画像或改变老人/家属对话流程。
 
 ### `GET /doctor/elderly/{elderly_id}`
 
@@ -553,6 +584,82 @@ Authorization: Bearer <family-token>
 - 当前结构化画像
 - 该老人全部工作区会话元数据
 - 该老人全部报告摘要
+- `overview`
+- `management`
+- `followups`
+
+### `GET /doctor/elderly/{elderly_id}/followups`
+
+返回该老人的医生随访记录列表：
+
+```json
+{
+  "data": [
+    {
+      "followup_id": "uuid",
+      "elderly_user_id": "uuid",
+      "doctor_id": "uuid",
+      "visit_type": "电话",
+      "findings": "近一周夜间起身增多。",
+      "recommendations": ["两周内复评步态"],
+      "contacted_family": true,
+      "arranged_revisit": true,
+      "referred": false,
+      "next_followup_at": "2026-04-05T10:00:00",
+      "notes": "建议继续观察夜间如厕风险",
+      "created_at": "2026-03-20T08:00:00+00:00",
+      "updated_at": "2026-03-20T08:00:00+00:00"
+    }
+  ]
+}
+```
+
+### `POST /doctor/elderly/{elderly_id}/followups`
+
+保存一条医生随访记录。
+
+请求体：
+
+```json
+{
+  "visitType": "电话",
+  "findings": "近一周夜间起身增多，家属反馈步态较前变慢。",
+  "recommendations": ["两周内复评步态", "提醒家属加强夜间照护"],
+  "contactedFamily": true,
+  "arrangedRevisit": true,
+  "referred": false,
+  "nextFollowupAt": "2026-04-05T10:00:00",
+  "notes": "建议继续观察夜间如厕风险"
+}
+```
+
+说明：
+
+- `visitType` 当前仅支持 `门诊`、`电话`、`上门`
+- 保存随访后，会同步刷新医生侧 `management` 的最近随访信息
+- 不会修改老人原始画像
+
+### `PATCH /doctor/elderly/{elderly_id}/management`
+
+更新医生端管理状态。
+
+请求体字段均为可选：
+
+```json
+{
+  "isKeyCase": true,
+  "managementStatus": "priority_follow_up",
+  "contactedFamily": true,
+  "arrangedRevisit": true,
+  "referred": false,
+  "nextFollowupAt": "2026-04-05T10:00:00"
+}
+```
+
+说明：
+
+- 这是医生侧管理层，不会覆盖老人画像字段
+- 适合前端做“标记重点管理对象”“已联系家属”“已安排复诊/复评”等状态管理
 
 ## 5.9 语音转文字
 
@@ -600,5 +707,5 @@ Authorization: Bearer <family-token>
 1. 老人端 token 由 `POST /chat/start` 直接签发，当前没有单独的老人登录页。
 2. `POST /auth/logout` 目前不做服务端 token 撤销。
 3. `GET /report/{report_id}/export/pdf` 尚未实现 PDF 导出，仅完成鉴权。
-4. 医生端当前仅支持只读，不支持编辑老人画像、删除会话、生成报告。
+4. 医生端当前支持读取全部老人数据，并维护医生侧随访记录与管理状态；仍不支持编辑老人画像、删除会话、生成报告。
 5. 医生账号当前不开放注册，只支持环境变量初始化默认账号。
