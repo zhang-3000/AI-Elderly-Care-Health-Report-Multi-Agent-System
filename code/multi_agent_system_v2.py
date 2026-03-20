@@ -1,81 +1,28 @@
 """
-AI 养老健康多 Agent 协作系统 V2.0
+AI 养老健康多 Agent 协作系统 V3.0
 新版：健康评估与照护行动计划
 
-改进：
-1. 新增 ActionPlanAgent - 生成可执行的行动计划
-2. 新增 PriorityAgent - 智能排序优先级
-3. 调整 RiskAgent - 短期/中期风险预测
-4. 调整 FactorAgent - 健康画像生成
-5. 重构 ReportAgent - 新版报告模板
+V3修改部分：
+1.stage1-6各prompt（修改判定逻辑、添加规则、修改json字段）
+2.635、710、952行调用函数增大了max token，并在185行call_llm中新增了对应参数
+3.104行添加了两个函数用于计算数据完整度及其档位
+4.810行添加了profile参数用于调用第3条的函数，830行用代码添加了json相应字段，1022行调用该函数时增加了对应参数
+5.各函数、stage名称、调度中心可视化新增“V3”字样
 """
 
 import json
-import logging
 import pandas as pd
 import os
 from openai import OpenAI
-import time
-from typing import Callable, Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from pathlib import Path
-
-try:
-    from rag import PageIndexRAGAgent
-except Exception:
-    PageIndexRAGAgent = None
 
 # DeepSeek API 配置 - 优先使用环境变量
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-
-# 临时清除代理环境变量（因为 Cursor 的代理返回 403）
-for key in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']:
-    if key in os.environ:
-        del os.environ[key]
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-logger = logging.getLogger(__name__)
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        return default
-
-
-LLM_TIMEOUT_SECONDS = max(_env_float("DEEPSEEK_TIMEOUT_SECONDS", 180.0), 1.0)
-LLM_MAX_RETRIES = max(_env_int("DEEPSEEK_MAX_RETRIES", 2), 0)
-LLM_RETRY_DELAY_SECONDS = max(_env_float("DEEPSEEK_RETRY_DELAY_SECONDS", 2.0), 0.0)
-
-
-RAG_ENABLED = _env_flag("RAG_ENABLED", False)
-DEFAULT_RAG_INDEX_PATH = Path(__file__).resolve().parent.parent / "data" / "rag_indexes" / "default_index.json"
-RAG_INDEX_PATH = Path(os.getenv("RAG_INDEX_PATH", str(DEFAULT_RAG_INDEX_PATH))).expanduser()
-RAG_TOP_K = max(int(os.getenv("RAG_TOP_K", "3")), 1)
 
 
 @dataclass
@@ -88,10 +35,10 @@ class UserProfile:
     residence: str = None
     education_years: int = None
     marital_status: str = None
-    
+
     # 健康限制（重要指标）
     health_limitation: str = None  # e0: 过去6个月是否因健康问题限制了活动
-    
+
     # BADL (6项)
     badl_bathing: str = None
     badl_dressing: str = None
@@ -99,7 +46,7 @@ class UserProfile:
     badl_transferring: str = None
     badl_continence: str = None
     badl_eating: str = None
-    
+
     # IADL (8项)
     iadl_visiting: str = None
     iadl_shopping: str = None
@@ -109,7 +56,7 @@ class UserProfile:
     iadl_carrying: str = None
     iadl_crouching: str = None
     iadl_transport: str = None
-    
+
     # 慢性病
     hypertension: str = None
     diabetes: str = None
@@ -118,7 +65,7 @@ class UserProfile:
     cataract: str = None
     cancer: str = None
     arthritis: str = None
-    
+
     # 认知功能
     cognition_time: str = None
     cognition_month: str = None
@@ -126,24 +73,24 @@ class UserProfile:
     cognition_place: str = None
     cognition_calc: List[str] = None
     cognition_draw: str = None
-    
+
     # 心理状态
     depression: str = None
     anxiety: str = None
     loneliness: str = None
-    
+
     # 生活方式
     smoking: str = None
     drinking: str = None
     exercise: str = None
     sleep_quality: str = None
-    
+
     # 生理指标
     weight: float = None
     height: float = None
     vision: str = None
     hearing: str = None
-    
+
     # 社会支持
     living_arrangement: str = None
     cohabitants: int = None
@@ -151,133 +98,107 @@ class UserProfile:
     income: float = None
     medical_insurance: str = None
     caregiver: str = None
-    
+
     user_type: str = "elderly"
 
+def is_missing(v) -> bool:
+    if v is None:
+        return True
+    s = str(v).strip()
+    return s == "" or s.upper() == "#NULL!" or s == "未知"
+
+def completeness_score(profile: UserProfile) -> dict:
+    groups = {
+        "function": {
+            "weight": 0.35,
+            "fields": [
+                profile.health_limitation,
+                profile.badl_bathing, profile.badl_dressing, profile.badl_toileting,
+                profile.badl_transferring, profile.badl_continence, profile.badl_eating,
+                profile.iadl_visiting, profile.iadl_shopping, profile.iadl_cooking,
+                profile.iadl_laundry, profile.iadl_walking, profile.iadl_carrying,
+                profile.iadl_crouching, profile.iadl_transport,
+            ]
+        },
+        "disease": {
+            "weight": 0.25,
+            "fields": [
+                profile.age, profile.heart_disease, profile.stroke,
+                profile.hypertension, profile.diabetes, profile.arthritis
+            ]
+        },
+        "psycho_social": {
+            "weight": 0.20,
+            "fields": [
+                profile.depression, profile.anxiety, profile.loneliness,
+                profile.living_arrangement, profile.caregiver
+            ]
+        },
+        "lifestyle_vitals": {
+            "weight": 0.15,
+            "fields": [
+                profile.smoking, profile.drinking, profile.exercise, profile.sleep_quality,
+                profile.height, profile.weight, profile.vision, profile.hearing
+            ]
+        },
+        "background": {
+            "weight": 0.05,
+            "fields": [profile.education_years, profile.medical_insurance, profile.financial_status]
+        }
+    }
+
+    total = 0.0
+    for g, info in groups.items():
+        fields = info["fields"]
+        present = sum(0 if is_missing(x) else 1 for x in fields)
+        ratio = present / max(len(fields), 1)
+        total += ratio * info["weight"]
+
+    score = int(round(total * 100))
+
+    if score == 100:
+        level = "满"
+    elif score >= 85:
+        level = "高"
+    elif score >= 60:
+        level = "中"
+    else:
+        level = "低"
+
+    notes = {
+        "满": "信息完整度为100%，结论与建议可信度最高。",
+        "高": "信息较完整，结论与建议可信度较高。",
+        "中": "信息部分缺失，部分结论偏预防性建议，建议补充信息。",
+        "低": "关键信息缺失较多，本报告仅供参考，建议补充信息后再生成。"
+    }[level]
+
+    return {"completeness_score": score, "confidence_level": level, "notes": notes}
 
 # ============ Agent 基类 ============
 class BaseAgent:
-    """Agent 基类（增强版 - 支持 RAG）"""
-    
-    def __init__(self, name: str, system_prompt: str, knowledge_agent=None):
+    """Agent 基类"""
+
+    def __init__(self, name: str, system_prompt: str):
         self.name = name
         self.system_prompt = system_prompt
-        self.knowledge_agent = knowledge_agent  # 可选的知识检索能力
 
-    @staticmethod
-    def _is_retryable_error(error: Exception) -> bool:
-        error_name = error.__class__.__name__.lower()
-        error_text = str(error).lower()
-        retry_markers = (
-            "connection",
-            "timeout",
-            "timed out",
-            "rate limit",
-            "temporarily unavailable",
-            "server disconnected",
-            "502",
-            "503",
-            "504",
-        )
-        return (
-            "connection" in error_name
-            or "timeout" in error_name
-            or any(marker in error_text for marker in retry_markers)
-        )
-    
-    def call_llm(self, user_prompt: str, temperature: float = 0.3) -> str:
+    def call_llm(self, user_prompt: str, temperature: float = 0.3, max_tokens: int = 2048) -> str:
         """调用 LLM"""
-        total_attempts = LLM_MAX_RETRIES + 1
-        for attempt in range(1, total_attempts + 1):
-            started_at = time.monotonic()
-            try:
-                logger.info(
-                    "[%s] LLM request started attempt=%s/%s model=%s prompt_chars=%s timeout=%.1fs",
-                    self.name,
-                    attempt,
-                    total_attempts,
-                    DEEPSEEK_MODEL,
-                    len(user_prompt),
-                    LLM_TIMEOUT_SECONDS,
-                )
-                response = client.chat.completions.create(
-                    model=DEEPSEEK_MODEL,
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=temperature,
-                    max_tokens=2000,
-                    timeout=LLM_TIMEOUT_SECONDS,
-                )
-                duration = time.monotonic() - started_at
-                logger.info(
-                    "[%s] LLM request finished attempt=%s/%s duration=%.2fs",
-                    self.name,
-                    attempt,
-                    total_attempts,
-                    duration,
-                )
-                return response.choices[0].message.content.strip()
-            except Exception as error:
-                duration = time.monotonic() - started_at
-                retryable = attempt < total_attempts and self._is_retryable_error(error)
-                logger.warning(
-                    "[%s] LLM request failed attempt=%s/%s duration=%.2fs retryable=%s error=%s",
-                    self.name,
-                    attempt,
-                    total_attempts,
-                    duration,
-                    retryable,
-                    error,
-                )
-                if not retryable:
-                    raise
-                sleep_seconds = LLM_RETRY_DELAY_SECONDS * attempt
-                if sleep_seconds > 0:
-                    time.sleep(sleep_seconds)
-    
-    def call_llm_with_rag(
-        self, 
-        user_prompt: str, 
-        rag_query: Optional[str] = None,
-        rag_top_k: int = 2,
-        temperature: float = 0.3
-    ) -> str:
-        """
-        调用 LLM，可选地使用 RAG 增强
-        
-        Args:
-            user_prompt: 用户提示词
-            rag_query: RAG 检索查询（如果为 None 则不使用 RAG）
-            rag_top_k: RAG 返回结果数量
-            temperature: LLM 温度参数
-        
-        Returns:
-            LLM 响应文本
-        """
-        # 如果提供了 RAG 查询且知识代理可用
-        if rag_query and self.knowledge_agent:
-            try:
-                rag_result = self.knowledge_agent.retrieve(rag_query, top_k=rag_top_k)
-                knowledge_context = rag_result.get('context', '')
-                
-                if knowledge_context:
-                    # 将知识注入到 prompt 中
-                    enhanced_prompt = f"""{user_prompt}
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"Error: {str(e)}"
 
-【专业知识参考】
-{knowledge_context}
 
-请结合以上专业标准和指南进行分析，确保建议的科学性和权威性。"""
-                    user_prompt = enhanced_prompt
-            except Exception as e:
-                print(f"⚠️ {self.name} RAG 检索失败: {e}")
-        
-        # 调用 LLM
-        return self.call_llm(user_prompt, temperature)
-
-    
     def parse_json(self, text: str) -> Dict:
         """解析 JSON 输出"""
         try:
@@ -290,10 +211,10 @@ class BaseAgent:
             return {"error": "JSON解析失败", "raw": text}
 
 
-# ============ Stage 1: 状态判定 Agent ============
-class StatusAgent(BaseAgent):
-    """状态判定 Agent - 基于 BADL/IADL 判定失能状态"""
-    
+# ============ Stage 1: 状态判定 Agent V3 ============
+class StatusAgentV3(BaseAgent):
+    """状态判定 Agent V3 - 基于 BADL/IADL 判定失能状态"""
+
     def __init__(self):
         system_prompt = """你是失能状态判定专家。根据用户的健康限制、BADL 和 IADL 数据判定失能状态。
 
@@ -315,21 +236,19 @@ IADL（工具性日常生活活动）8项：串门、购物、做饭、洗衣、
 - "有点困难" = 部分困难
 - "不能做" = 完全不能
 
-【状态分类】
-- 状态 0（功能完好）：所有 BADL 完全自理 且 IADL 大部分能做
-- 状态 1（需要部分协助）：1-3个 BADL 完全依赖，或 1-7个 IADL 完全不能
-- 状态 2（需要全面照护）：≥4个 BADL 完全依赖，或 8个 IADL 全部不能
+【状态分类（判定顺序）】
+1) 若满足任一条件 ⇒ 状态2（需要全面照护）：
+   - BADL“多方面帮助”≥4；或 IADL“不能做”=8
+2) 否则，若满足任一条件 ⇒ 状态1（需要部分协助）：
+   - BADL“多方面帮助”在1-3；或 IADL“不能做”在1-7；
+3) 否则 ⇒ 状态0（功能完好）
+- 若出现以下情况，需在explaination中明确指出分类依据：BADL 仍可自理，但 IADL 出现完全不能项目，因此归为需要部分协助。
 
-【综合判断原则】
-- 健康限制"严重"且BADL多项依赖 → 倾向状态2
-- 健康限制"有些"且IADL部分困难 → 倾向状态1
-- 健康限制"否"且功能良好 → 倾向状态0
 
 【输出格式】JSON
 {
     "status": 0或1或2,
     "status_name": "功能完好/需要部分协助/需要全面照护",
-    "status_description": "生活自理/需要较多协助/需要全面照护支持",
     "health_limitation_impact": "健康限制对功能的影响说明",
     "badl_depend_count": BADL完全依赖数量,
     "iadl_unable_count": IADL完全不能数量,
@@ -337,8 +256,8 @@ IADL（工具性日常生活活动）8项：串门、购物、做饭、洗衣、
     "iadl_details": ["具体受限的IADL项目"],
     "explanation": "用通俗语言解释判定依据（80字以内）"
 }"""
-        super().__init__("StatusAgent", system_prompt)
-    
+        super().__init__("StatusAgentV3", system_prompt)
+
     def judge(self, profile: UserProfile) -> Dict:
         """判定失能状态"""
         badl_info = f"""
@@ -363,23 +282,26 @@ IADL（工具性日常生活活动）8项：串门、购物、做饭、洗衣、
 - 蹲起: {profile.iadl_crouching}
 - 公共交通: {profile.iadl_transport}
 """
-        result = self.call_llm(f"请判定以下老人的失能状态：\n{badl_info}")
+        result = self.call_llm(f"判定以下老人的失能状态：\n{badl_info}")
         return self.parse_json(result)
 
 
 
-# ============ Stage 2: 风险预测 Agent (V2 - 调整) ============
-class RiskAgentV2(BaseAgent):
-    """风险预测 Agent V2 - 按时间维度预测短期/中期风险"""
-    
-    def __init__(self):
-        system_prompt = """你是老年健康风险预测专家。请按时间维度评估风险，便于家属制定行动计划。
+# ============ Stage 2: 风险预测 Agent V3 ============
+class RiskAgentV3(BaseAgent):
+    """风险预测 Agent V3 - 按时间维度预测短期/中期风险"""
 
-【风险识别原则】
-1. 优先识别"最要命、最可防"的风险
-2. 给出具体触发场景，不要抽象描述
-3. 区分可预防 vs 不可预防
-4. 用因果链表达中期风险（如：营养↓→肌肉↓→跌倒↑）
+    def __init__(self):
+        system_prompt = """你是老年健康风险预测专家。按时间维度评估风险，便于家属制定行动计划。
+
+【输出原则】
+1. 优先识别"最要命、最可防"的风险。
+2. 给出具体触发场景，不要抽象描述，得出trigger。
+3. 区分可预防/不可预防，得出preventable。
+4. 在short_term_risks的每一个risk中，展示输入中的1-3个风险原因如（"心脏病=是""IADL不能:提重物"），必须从输入中获得，禁止编造。
+5. 在medium_term_risks中的每一个risk中，展示推理因果链chain（如：营养↓→肌肉↓→跌倒↑）。
+6. 禁止出现/推断输入未提供的具体生活感受，例如"胃口差/吃不下"，而是写"能量与蛋白质摄入可能不足（需结合体重变化判断）"这一类中性判断。
+7. overall_risk_level必须由各个risk的severity分析得出，禁止单独分析。
 
 【高风险因素（CLHLS证据）】
 - 年龄≥85岁、中风病史、认知障碍、多病共存、独居无照护
@@ -392,6 +314,7 @@ class RiskAgentV2(BaseAgent):
             "timeframe": "1-4周",
             "risk": "具体风险名称",
             "trigger": "触发场景（如夜间起床、卫生间）",
+            "evidence": ["证据1","证据2"],
             "severity": "高/中/低",
             "preventable": true/false,
             "prevention_key": "预防关键点"
@@ -407,13 +330,13 @@ class RiskAgentV2(BaseAgent):
             "prevention_key": "预防关键点"
         }
     ],
-    "overall_risk_level": "低/中/高",
+    "overall_risk_level": "高/中/低",
     "risk_summary": "风险总结（80字以内）"
 }"""
-        super().__init__("RiskAgentV2", system_prompt)
-    
+        super().__init__("RiskAgentV3", system_prompt)
+
     def predict(self, profile: UserProfile, current_status: int) -> Dict:
-        """预测风险（增强版 - 支持 RAG）"""
+        """预测风险"""
         risk_factors = f"""
 【基本信息】
 当前失能状态: {current_status} (0=无失能, 1=部分失能, 2=严重失能)
@@ -466,41 +389,15 @@ class RiskAgentV2(BaseAgent):
 - 照护者: {profile.caregiver}
 - 医保: {profile.medical_insurance}
 """
-        
-        # 构建 RAG 查询：针对高风险因素
-        rag_query = None
-        if self.knowledge_agent:
-            # 识别关键风险因素
-            risk_keywords = []
-            age = int(profile.age) if profile.age else 0
-            if age >= 85:
-                risk_keywords.append("高龄老人")
-            if profile.stroke in ["是", "有"]:
-                risk_keywords.append("中风")
-            if profile.heart_disease in ["是", "有"]:
-                risk_keywords.append("心脏病")
-            if profile.diabetes in ["是", "有"]:
-                risk_keywords.append("糖尿病")
-            if current_status >= 1:
-                risk_keywords.append("失能")
-            
-            if risk_keywords:
-                rag_query = f"{age}岁 {' '.join(risk_keywords[:3])} 风险预防 健康标准"
-        
-        # 使用 RAG 增强的 LLM 调用
-        result = self.call_llm_with_rag(
-            f"请评估以下老人的短期和中期风险：\n{risk_factors}",
-            rag_query=rag_query,
-            rag_top_k=2
-        )
+        result = self.call_llm(f"评估以下老人的短期和中期风险：\n{risk_factors}")
         return self.parse_json(result)
 
 
 
-# ============ Stage 3: 因素分析 Agent (V2 - 调整) ============
-class FactorAgentV2(BaseAgent):
-    """因素分析 Agent V2 - 生成健康画像"""
-    
+# ============ Stage 3: 因素分析 Agent V3 ============
+class FactorAgentV3(BaseAgent):
+    """因素分析 Agent V3 - 生成健康画像"""
+
     def __init__(self):
         system_prompt = """你是老年健康因素分析专家。生成"健康画像"，清晰呈现"好在哪里、短板在哪里"。
 
@@ -513,16 +410,25 @@ class FactorAgentV2(BaseAgent):
 不可改变：年龄、性别、既往中风、教育程度
 可改变：体力活动、慢性病管理、认知训练、社会参与、营养状态、情绪管理
 
+【输出规则】
+1. functional_status的level必须与status_result的status_name字段一致。
+2. functional_status的description必须与status_result的explanation字段（判定依据）一致。
+3. strengths 3-5条，且必须来自输入证据，且每条必须带一个简短依据
+    - 例如 "未吸烟（d71=否）"、"听力良好（g106=好）"、"BADL自理（6项均不需要帮助）"
+    - 禁止出现无依据的描述，例如：营养良好/身体很好/恢复不错（除非 BMI、体重变化、营养变量支持）
+4. main_problems不超过5个。
+5. changeable_factors 必须与 main_problems 中的一项对应，禁止使用main_problems未提到的因素。
+
 【输出格式】JSON
 {
     "functional_status": {
         "level": "功能完好/需要部分协助/需要全面照护",
-        "description": "可独立完成穿衣、进食、洗漱、如厕，并能处理家务、购物等事务"
+        "description": "与状态判定一致的通俗描述（引用 status_result.explanation）"
     },
     "strengths": [
-        "有活动习惯",
-        "头脑清晰",
-        "未提示高血压/糖尿病等部分慢病负担"
+        "未吸烟（d71=否）",
+        "听力良好（g106=好）",
+        "BADL自理（6项均不需要帮助）"
     ],
     "main_problems": [
         {
@@ -539,11 +445,11 @@ class FactorAgentV2(BaseAgent):
     "unchangeable_factors": ["年龄", "性别", "教育程度"],
     "changeable_factors": ["体力活动", "慢性病管理", "情绪管理"]
 }"""
-        super().__init__("FactorAgentV2", system_prompt)
-    
+        super().__init__("FactorAgentV3", system_prompt)
+
     def analyze(self, profile: UserProfile, status_result: Dict, risk_result: Dict) -> Dict:
         """分析影响因素并生成健康画像"""
-        
+
         # 计算BMI（如果有身高体重）
         bmi_info = ""
         if profile.weight and profile.height:
@@ -562,7 +468,7 @@ class FactorAgentV2(BaseAgent):
                     bmi_info += "(肥胖)"
             except:
                 pass
-        
+
         all_info = f"""
 【基本信息】
 年龄: {profile.age}岁, 性别: {profile.sex}
@@ -619,61 +525,72 @@ IADL受限: {status_result.get('iadl_details', [])}
 
 【风险评估结果】
 - 总体风险: {risk_result.get('overall_risk_level', '未知')}
-- 短期风险: {[r.get('risk') for r in risk_result.get('short_term_risks', [])]}
-- 中期风险: {[r.get('risk') for r in risk_result.get('medium_term_risks', [])]}
+- 短期风险: {[f"{r.get('risk')}({r.get('severity')})" for r in risk_result.get('short_term_risks', [])]}
+- 中期风险: {[f"{r.get('risk')}({r.get('severity')})" for r in risk_result.get('medium_term_risks', [])]}
 """
-        result = self.call_llm(f"请生成健康画像：\n{all_info}")
+        result = self.call_llm(f"生成健康画像：\n{all_info}")
         return self.parse_json(result)
 
 
 
-# ============ Stage 4: 行动计划 Agent (新增) ============
-class ActionPlanAgent(BaseAgent):
-    """行动计划生成 Agent - 将建议转化为可执行的行动计划"""
-    
+# ============ Stage 4: 行动计划 Agent V3 ============
+class ActionPlanAgentV3(BaseAgent):
+    """行动计划生成 Agent V3 - 将建议转化为可执行的行动计划"""
+
     def __init__(self):
         system_prompt = """你是照护行动计划专家。将健康建议转化为可执行的行动计划。
 
 【行动计划要素】
-- 负责人：明确谁来做（家属/照护者/老人自己）
 - 怎么做：具体步骤，可直接执行
 - 完成标准：可验证的结果
 - 时间框架：建议完成时间
 - 难度/成本/影响：便于优先级排序
 
-【输出原则】
-1. 每个行动都要"可落地、可验证、可完成"
-2. 避免"建议锻炼"这种模糊表述，要具体到"每天上下午各5-10分钟"
-3. 给出"完成标准"而非"做法标准"
-4. 考虑农村/城市、独居/同住等实际情况
+【输出规则】
+1. actions 数量必须为 8-12 条；必须覆盖以下6类。category 只能取：
+   - 医疗保障与就医通道
+   - 慢性病管理
+   - 居家安全
+   - 活动与营养
+   - 情绪与社交
+   - 照护资源对接
+2. 每条 action 必须包含所有字段：action_id/title/subtitle/responsible/how_to_do/completion_criteria/timeframe/difficulty/cost/impact/category。
+3. 每个行动都要"可落地、可验证、可完成"。
+4. 避免"建议锻炼"、"高质量"这种模糊表述或形容词，而要具体到"每天上下午各5-10分钟"等具体的标准。
+5. 给出"完成标准"而非"做法标准"。
+6. 考虑农村/城市、独居/同住等实际情况。
+7. completion_criteria 必须是“可验收证据”，可通过记录/照片/测量值/预约凭证/清单勾选验证；
+   禁止使用“感觉更好/尽量/适当/注意/坚持”作为完成标准。
+8. 禁止编造未提供的检查结果、药名/剂量、具体饮食障碍等事实；如需提及，必须使用条件句“如果检查结果为则…”。
+9. 禁止提供专业医学诊断建议，禁止提及任何药物名称、禁止提及具体医学阈值（如血糖、血压具体值）。如需提及本条所述内容，必须明确使用"建议就医获取具体标准/处方"或"医生开具的药物"等字样。
+10. difficulty/cost/impact 只能取：低/中/高；timeframe 只能取：立刻/24小时内/48小时内/本周/两周内/本月/1-3个月（择一）。
+
 
 【输出格式】JSON
 {
     "actions": [
         {
             "action_id": "A1",
-            "title": "把"就医通道"先建立起来",
+            "title": "把\"就医通道\"先建立起来",
             "subtitle": "医保 + 就近固定就诊点",
-            "responsible": "家属/主要照护者",
             "how_to_do": [
                 "带身份证、户口本去村委会或乡镇医保经办点办理城乡居民医保",
                 "若医保短期办不下来：先去乡镇卫生院建档"
             ],
-            "completion_criteria": "明确"以后看病去哪里、谁负责陪诊、紧急时打谁电话"",
+            "completion_criteria": "明确\"以后看病去哪里、谁负责陪诊、紧急时打谁电话\"",
             "timeframe": "1-2周内完成",
             "difficulty": "中",
             "cost": "低",
             "impact": "高",
-            "category": "医疗保障"
+            "category": "医疗保障与就医通道"
         }
     ]
 }"""
-        super().__init__("ActionPlanAgent", system_prompt)
-    
+        super().__init__("ActionPlanAgentV3", system_prompt)
+
     def generate(self, profile: UserProfile, status_result: Dict,
-                 risk_result: Dict, factor_result: Dict,
-                 knowledge_context: str = "") -> Dict:
-        """生成行动计划（增强版 - 支持 RAG）"""
+                 risk_result: Dict, factor_result: Dict) -> Dict:
+        """生成行动计划"""
         context = f"""
 【用户画像】
 年龄: {profile.age}岁, 性别: {profile.sex}
@@ -705,93 +622,77 @@ class ActionPlanAgent(BaseAgent):
 居住地: {profile.residence}
 
 【用户类型】
-{profile.user_type}（请根据用户类型调整语言风格）
+{profile.user_type}（根据用户类型调整语言风格）
 
-请生成8-12个具体的行动计划，涵盖：
+生成8-12个具体的行动计划，涵盖：
 1. 医疗保障与就医通道
 2. 慢性病管理
-3. 居家安全（防跌倒）
+3. 居家安全
 4. 活动与营养
 5. 情绪与社交
 6. 照护资源对接
 """
-        
-        # 构建 RAG 查询：针对最紧迫的行动需求
-        rag_query = None
-        if self.knowledge_agent:
-            # 提取高风险项
-            high_risks = [r for r in risk_result.get('short_term_risks', []) 
-                         if r.get('severity') == '高']
-            
-            age = int(profile.age) if profile.age else 0
-            
-            if high_risks:
-                # 针对高风险生成查询
-                risk_name = high_risks[0].get('risk', '')
-                rag_query = f"{age}岁老人 {risk_name} 预防措施 具体方法"
-            else:
-                # 针对慢性病管理生成查询
-                diseases = []
-                if profile.hypertension in ["是", "有"]:
-                    diseases.append("高血压")
-                if profile.diabetes in ["是", "有"]:
-                    diseases.append("糖尿病")
-                if diseases:
-                    rag_query = f"老年人 {' '.join(diseases[:2])} 日常管理 居家照护"
-        
-        if knowledge_context:
-            context += f"""
-
-【RAG知识库参考】
-以下内容来自项目内置知识库，仅作辅助参考。请结合当前老人的具体情况吸收使用，不要逐字照抄，也不要生成与个体情况矛盾的建议。
-
-{knowledge_context}
-"""
-        
-        # 使用 RAG 增强的 LLM 调用
-        result = self.call_llm_with_rag(
-            context,
-            rag_query=rag_query,
-            rag_top_k=2
-        )
+        result = self.call_llm(user_prompt=context, max_tokens=4096)
         return self.parse_json(result)
 
 
 
-# ============ Stage 5: 优先级排序 Agent (新增) ============
-class PriorityAgent(BaseAgent):
-    """优先级排序 Agent - 智能排序行动计划"""
-    
+# ============ Stage 5: 优先级排序 Agent V3 ============
+class PriorityAgentV3(BaseAgent):
+    """优先级排序 Agent V3 - 智能排序行动计划"""
+
     def __init__(self):
-        system_prompt = """你是行动优先级排序专家。基于风险紧急度、可行性、成本效益排序。
+        system_prompt = """你是行动优先级排序专家。基于紧急度、可行性、成本效益等维度对老年人行动清单进行排序与分级。
 
 【排序维度】
-1. 风险严重度（会不会要命）- 权重40%
+1. 紧急度（包含下列两个因素）- 权重40%
+    - 风险因素（如可能导致疾病、失能、死亡等）- 权重20%
+    - 时间敏感性（是否越早做越能改变结局）- 权重20%
 2. 可预防性（做了有没有用）- 权重30%
-3. 可行性（能不能做到）- 权重20%
-4. 成本效益（投入产出比）- 权重10%
+3. 可行性（能不能做到）- 权重25%
+4. 成本效益（投入产出比）- 权重5%
 
-【分级原则】
-- A级（第一优先）：3项以内，"最要命、最可防、最好做"
-- B级（第二优先）：4-7项，日常维持类
-- C级（第三优先）：长期改善类
+【排序分级规则】
+1. 将上述各个个维度分别评分，得出scores字段中的risk_severity/time_criticality/urgency/preventability/feasibility/cost_effectiveness。
+    - risk_severity/time_criticality/preventability/feasibility/cost_effectiveness必须为0-10之间的整数
+    - 必须有urgency=(risk_severity+time_criticality)/2，保留1位小数。
+2. 按照权重计算行动加权得分，得出weighted_score，保留1位小数。
+3. 如果某一 action 的 urgency >= 9.0（即如果不做就会导致失能/死亡等严重健康结局），必须将它的 rank 设为当前最高（如有多个此类action，则将它们的rank按urgency排序为1，2，3...)，必须直接将它归入A类，禁止被后续排序影响。
+4. 将其余各个 action 根据 weighted_score 进行排序，得到 rank 字段。然后再将它们分入ABC三个优先级中，优先级必须满足如下约束：
+    - A级（第一优先）：3项以内，"最要命、最可防、最好做"
+    - B级（第二优先）：4-7项，日常维持类
+    - C级（第三优先）：长期改善类
+5. 简要解释每个 action 的排序依据（包括规则4的特殊排序和规则5的常规排序），得出 reason 字段。
 
 【输出格式】JSON
 {
+    "weights": {
+        "urgency": 0.40,
+        "preventability": 0.30,
+        "feasibility": 0.25,
+        "cost_effectiveness": 0.05
+    },
     "priority_a": [
         {
-            "action_id": "A3",
-            "rank": 1,
-            "reason": "成本低但收益最大，立即可做",
-            "urgency": "立刻"
+        "action_id": "A1",
+        "rank": 1,
+        "scores": {
+            "risk_severity": 10,
+            "time_criticality": 10,
+            "urgency": 10.0,
+            "preventability": 8,
+            "feasibility": 9,
+            "cost_effectiveness": 8
+        },
+        "weighted_score": 9.0,
+        "reason": ""属于短期重大风险对策，必须进入A类并排在前列""
         }
     ],
-    "priority_b": [...],
-    "priority_c": [...],
-    "排序说明": "简要说明排序逻辑"
+    "priority_b": [],
+    "priority_c": []
 }"""
-        super().__init__("PriorityAgent", system_prompt)
-    
+        super().__init__("PriorityAgentV3", system_prompt)
+
     def rank(self, actions: List[Dict], risks: Dict) -> Dict:
         """排序行动计划"""
         context = f"""
@@ -803,26 +704,42 @@ class PriorityAgent(BaseAgent):
 中期风险: {json.dumps(risks.get('medium_term_risks', []), ensure_ascii=False)}
 总体风险: {risks.get('overall_risk_level', '未知')}
 
-请将行动计划按优先级分为A/B/C三级，每级给出排序理由。
+将行动计划按优先级分为A/B/C三级，给出排序理由。
+每个 action 的 difficulty/cost/impact/timeframe 字段可用来判断 feasibility 与 cost_effectiveness 与 time_criticality。
 """
-        result = self.call_llm(context)
+        result = self.call_llm(user_prompt=context, max_tokens=4096)
         return self.parse_json(result)
 
 
 
-# ============ Stage 6: 反思校验 Agent ============
-class ReviewAgent(BaseAgent):
-    """反思校验 Agent - 检查输出质量和一致性"""
-    
+# ============ Stage 6: 反思校验 Agent V3 ============
+class ReviewAgentV3(BaseAgent):
+    """反思校验 Agent V3 - 检查输出质量和一致性"""
+
     def __init__(self):
         system_prompt = """你是健康报告质量审核专家，负责检查报告的准确性、一致性和安全性。
 
-【检查要点】
-1. 一致性：状态判定与风险预测是否矛盾
-2. 合理性：行动计划是否与风险因素匹配
-3. 安全性：是否有需要紧急就医的情况
-4. 可执行性：行动计划是否具体可落地
-5. 完整性：是否覆盖了所有必要内容
+【硬规则核查（必须逐项检查）】
+1. Stage1/Stage3一致性
+- factor_result.functional_status.level 必须等于 status_result.status_name
+- factor_result.functional_status.description 必须等于 status_result.explanation
+若不一致：consistency_check.passed=false，并指出字段。
+
+2. Stage2风险结构
+- short_term_risks / medium_term_risks 每条必须有 risk、severity、preventable、prevention_key
+- 若存在 evidence 字段，必须是数组且每条为输入事实短语；不得出现“胃口差/吃不下”等生活感受断言（除非输入明确提供）
+
+3. Stage4行动计划质量
+- actions 必须是列表，数量 8-12
+- 每条 action 必须包含 action_id/title/subtitle//how_to_do/completion_criteria/timeframe/difficulty/cost/impact/category
+- category 必须覆盖且只能从6类中选取：医疗保障与就医通道/慢性病管理/居家安全/活动与营养/情绪与社交/照护资源对接；若缺类：completeness_check.passed=false 并列出缺失类
+- completion_criteria 必须可验收（记录/照片/测量/预约凭证/清单勾选）；若出现“尽量/注意/坚持/感觉更好”等：executability_check.passed=false并点名 action_id
+
+4. Stage5排序质量
+- priority_a 数量<=3，priority_b 4-7，其余在C
+- rank 必须从1开始递增且不重复
+- 若提供 weighted_score：除规则4强制置顶外，应与 rank 大体一致（分数高排前）
+- 若 priority_result JSON 解析失败：format_check.passed=false，approved=false
 
 【紧急情况识别】
 需要立即就医的情况：
@@ -834,17 +751,63 @@ class ReviewAgent(BaseAgent):
 
 【输出格式】JSON
 {
-    "consistency_check": {"passed": true/false, "issues": []},
-    "safety_check": {"urgent": true/false, "urgent_reason": ""},
-    "executability_check": {"passed": true/false, "issues": []},
-    "completeness_check": {"passed": true/false, "missing": []},
-    "suggestions": ["改进建议"],
+    "consistency_check": {
+        "passed": true/false,
+        "issues": [
+        {"stage":"status_vs_risk","problem":"...","evidence":"...","fix":"..."}
+        ]
+    },
+    "safety_check": {
+        "urgent": true/false,
+        "urgent_reason": "",
+        "red_flags": [],
+        "high_attention": ["短期高危心脏事件风险","跌倒骨折风险"]
+    },
+    "executability_check": {
+        "passed": true/false,
+        "issues": [
+        {"action_id":"A7","field":"completion_criteria","problem":"不可验收","fix":"改成记录/照片/测量值"}
+        ]
+    },
+    "completeness_check": {
+        "passed": true/false,
+        "missing": [],
+        "coverage": {
+        "action_count": 11,
+        "categories_present": [],
+        "categories_missing": []
+        }
+    },
+    "format_check": {
+        "passed": true/false,
+        "issues": [
+        {
+            "stage": "stage5_priority",
+            "problem": "priority_result 解析失败或字段不齐（例如缺 rank 或 rank 重复）",
+            "evidence": "priority_result 中 rank 不连续或重复：priority_b 出现 rank=2 两次",
+            "fix": "修正优先级输出：rank 从1开始递增且不重复；若输出过长导致截断，提升max_tokens或缩短字段"
+        }
+        ]
+    },
+    "safety_language_check": {
+        "passed": false,
+        "issues": [
+        {
+            "stage": "stage2_risk",
+            "problem": "evidence 中出现“胃口差/吃不下”等生活感受推断（输入未提供）",
+            "evidence": "short_term_risks[1].evidence 包含“胃口差”",
+            "fix": "改为中性表述：如“能量与蛋白质摄入可能不足（需结合体重变化判断）”，并避免在evidence中出现主观感受"
+        }
+        ]
+    },
+    "suggestions": ["..."],
     "overall_quality": "优/良/中/差",
     "approved": true/false
-}"""
-        super().__init__("ReviewAgent", system_prompt)
-    
-    def review(self, status_result: Dict, risk_result: Dict,
+}
+"""
+        super().__init__("ReviewAgentV3", system_prompt)
+
+    def review(self, profile: UserProfile, status_result: Dict, risk_result: Dict,
                factor_result: Dict, action_result: Dict, priority_result: Dict) -> Dict:
         """审核报告"""
         report_content = f"""
@@ -863,15 +826,19 @@ class ReviewAgent(BaseAgent):
 【优先级排序结果】
 {json.dumps(priority_result, ensure_ascii=False, indent=2)}
 """
-        result = self.call_llm(f"请审核以下健康评估报告：\n{report_content}")
-        return self.parse_json(result)
+        result = self.call_llm(f"审核以下健康评估报告：\n{report_content}")
+        review_json = self.parse_json(result)
+        input_quality = completeness_score(profile)
+        review_json["input_quality"] = input_quality
+
+        return review_json
 
 
 
 # ============ Stage 7: 报告生成 Agent (V2 - 重构) ============
 class ReportAgentV2(BaseAgent):
     """报告生成 Agent V2 - 使用新版报告模板"""
-    
+
     def __init__(self):
         system_prompt = """你是健康报告撰写专家，负责将评估结果整合为"健康评估与照护行动计划"。
 
@@ -887,32 +854,31 @@ class ReportAgentV2(BaseAgent):
 - 口语化、接地气
 - 避免医学术语
 - 强调"可以做什么"
-- 每个建议都有负责人、怎么做、完成标准
+- 每个建议都有怎么做、完成标准
 
 【输出格式】
 直接输出 Markdown 格式的报告，不要 JSON。"""
         super().__init__("ReportAgentV2", system_prompt)
-    
+
     def generate_report(self, profile: UserProfile, status_result: Dict,
                         risk_result: Dict, factor_result: Dict,
                         action_result: Dict, priority_result: Dict,
-                        review_result: Dict, knowledge_context: str = "") -> str:
+                        review_result: Dict) -> str:
         """生成最终报告"""
-        
+
         # 检查是否有紧急情况
         urgent = review_result.get('safety_check', {}).get('urgent', False)
         urgent_reason = review_result.get('safety_check', {}).get('urgent_reason', '')
-        
+
         context = f"""
-请根据以下评估结果，生成一份完整的"健康评估与照护行动计划"。
+根据以下评估结果，生成一份完整的"健康评估与照护行动计划"。
 
 【用户信息】
 年龄: {profile.age}岁, 性别: {profile.sex}
-用户类型: {profile.user_type}（请据此调整语言风格）
+用户类型: {profile.user_type}（据此调整语言风格）
 
 【状态判定】
 当前状态: {status_result.get('status_name', '未知')}
-状态描述: {status_result.get('status_description', '')}
 判定依据: {status_result.get('explanation', '')}
 
 【健康画像】
@@ -934,12 +900,12 @@ C级（第三优先）: {priority_result.get('priority_c', [])}
 是否紧急: {urgent}
 紧急原因: {urgent_reason}
 
-请按以下结构生成报告：
+按以下结构生成报告：
 
 # 健康评估与照护行动计划
 
 ## 0. 报告说明
-本报告基于您/家属提供的信息进行风险提示与照护建议，不能替代医生面诊；涉及用药与检查，请以医生意见为准。
+本报告基于您/家属提供的信息进行风险提示与照护建议，不能替代医生面诊；涉及用药与检查，以医生意见为准。
 
 ## 1. 健康报告总结
 用3句话总结：
@@ -971,7 +937,6 @@ C级（第三优先）: {priority_result.get('priority_c', [])}
 ### A. 第一优先级
 [对每个行动，按以下格式输出]
 **1）[行动标题]**
-- 负责人：[谁来做]
 - 怎么做：[具体步骤]
 - 完成标准：[如何验证]
 
@@ -984,286 +949,95 @@ C级（第三优先）: {priority_result.get('priority_c', [])}
 ## 5. 温馨寄语
 [一段温暖、鼓励的话，强调"按计划慢慢来，能做多少就做多少"]
 """
-        if knowledge_context:
-            context += f"""
-
-【RAG知识库参考】
-以下材料来自项目知识库，请仅在与当前老人情况一致时吸收为通俗建议，不要照抄原文，也不要引用过于学术化的表述：
-
-{knowledge_context}
-"""
-        return self.call_llm(context, temperature=0.5)
+        return self.call_llm(user_prompt=context, temperature=0.5, max_tokens=8192)
 
 
 
 # ============ 调度中心 Orchestrator V2 ============
 class OrchestratorAgentV2:
-    """调度中心 V2 - 协调7个Agent的执行（增强版 - RAG 深度融合）"""
-    
+    """调度中心 V2 - 协调7个Agent的执行"""
+
     def __init__(self):
-        # 首先初始化知识代理
-        self.knowledge_agent = self._init_knowledge_agent()
-        
-        # 初始化各个 Agent，并传递知识代理
-        self.status_agent = StatusAgent()
-        self.status_agent.knowledge_agent = self.knowledge_agent
-        
-        self.risk_agent = RiskAgentV2()
-        self.risk_agent.knowledge_agent = self.knowledge_agent
-        
-        self.factor_agent = FactorAgentV2()
-        self.factor_agent.knowledge_agent = self.knowledge_agent
-        
-        self.action_agent = ActionPlanAgent()
-        self.action_agent.knowledge_agent = self.knowledge_agent
-        
-        self.priority_agent = PriorityAgent()
-        self.priority_agent.knowledge_agent = self.knowledge_agent
-        
-        self.review_agent = ReviewAgent()
-        self.review_agent.knowledge_agent = self.knowledge_agent
-        
+        self.status_agent = StatusAgentV3()
+        self.risk_agent = RiskAgentV3()
+        self.factor_agent = FactorAgentV3()
+        self.action_agent = ActionPlanAgentV3()
+        self.priority_agent = PriorityAgentV3()
+        self.review_agent = ReviewAgentV3()
         self.report_agent = ReportAgentV2()
-        self.report_agent.knowledge_agent = self.knowledge_agent
 
-    def _init_knowledge_agent(self):
-        """初始化知识代理（使用新的 KnowledgeAgent）"""
-        if not RAG_ENABLED or PageIndexRAGAgent is None:
-            return None
-        if not RAG_INDEX_PATH.exists():
-            print(f"⚠️ RAG 已启用，但索引文件不存在: {RAG_INDEX_PATH}")
-            return None
-        try:
-            from knowledge_agent import KnowledgeAgent
-            rag_agent = PageIndexRAGAgent(index_path=str(RAG_INDEX_PATH))
-            return KnowledgeAgent(rag_agent)
-        except Exception as error:
-            print(f"⚠️ Knowledge Agent 初始化失败: {error}")
-            return None
-
-    @staticmethod
-    def _emit_stage_event(
-        stage_callback: Optional[Callable[[Dict[str, Any]], None]],
-        agent: str,
-        status: str,
-        message: str,
-        duration_seconds: Optional[float] = None,
-    ) -> None:
-        if stage_callback is None:
-            return
-        payload: Dict[str, Any] = {
-            "agent": agent,
-            "status": status,
-            "message": message,
-        }
-        if duration_seconds is not None:
-            payload["duration_seconds"] = round(duration_seconds, 2)
-        stage_callback(payload)
-
-    def _run_stage(
-        self,
-        stage_key: str,
-        running_message: str,
-        completed_message: str,
-        func: Callable[[], Any],
-        stage_callback: Optional[Callable[[Dict[str, Any]], None]],
-    ) -> Any:
-        self._emit_stage_event(stage_callback, stage_key, "running", running_message)
-        started_at = time.monotonic()
-        try:
-            result = func()
-        except Exception as error:
-            duration = time.monotonic() - started_at
-            logger.exception("Orchestrator stage failed: %s", stage_key)
-            self._emit_stage_event(
-                stage_callback,
-                stage_key,
-                "failed",
-                f"{running_message}失败: {error}",
-                duration_seconds=duration,
-            )
-            raise
-
-        duration = time.monotonic() - started_at
-        self._emit_stage_event(
-            stage_callback,
-            stage_key,
-            "completed",
-            completed_message,
-            duration_seconds=duration,
-        )
-        return result
-    
-    def run(
-        self,
-        profile: UserProfile,
-        verbose: bool = True,
-        stage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-    ) -> Dict:
+    def run(self, profile: UserProfile, verbose: bool = True) -> Dict:
         """执行完整评估流程"""
         results = {}
-        knowledge_context = ""
-        
-        # Stage 1: 状态判定
+
+        # Stage 1: 状态判定（V3）
         if verbose:
-            print("🔍 Stage 1: 状态判定 Agent 执行中...")
-        results['status'] = self._run_stage(
-            "status",
-            "正在判定功能状态...",
-            "功能状态判定完成",
-            lambda: self.status_agent.judge(profile),
-            stage_callback,
-        )
+            print("🔍 Stage 1: 状态判定 Agent V3 执行中...")
+        results['status'] = self.status_agent.judge(profile)
         if verbose:
             print(f"   → 状态: {results['status'].get('status_name', '未知')}")
-        
-        # Stage 2: 风险预测（V2）
+
+        # Stage 2: 风险预测（V3）
         if verbose:
-            print("📈 Stage 2: 风险预测 Agent V2 执行中...")
+            print("📈 Stage 2: 风险预测 Agent V3 执行中...")
         current_status = results['status'].get('status', 0)
-        results['risk'] = self._run_stage(
-            "risk",
-            "正在进行风险预测...",
-            "风险预测完成",
-            lambda: self.risk_agent.predict(profile, current_status),
-            stage_callback,
-        )
+        results['risk'] = self.risk_agent.predict(profile, current_status)
         if verbose:
             print(f"   → 风险等级: {results['risk'].get('overall_risk_level', '未知')}")
             print(f"   → 短期风险数: {len(results['risk'].get('short_term_risks', []))}")
-        
-        # Stage 3: 因素分析（V2）
+
+        # Stage 3: 因素分析（V3）
         if verbose:
-            print("🔬 Stage 3: 因素分析 Agent V2 执行中...")
-        results['factors'] = self._run_stage(
-            "factors",
-            "正在提取关键影响因素...",
-            "关键影响因素分析完成",
-            lambda: self.factor_agent.analyze(profile, results['status'], results['risk']),
-            stage_callback,
+            print("🔬 Stage 3: 因素分析 Agent V3 执行中...")
+        results['factors'] = self.factor_agent.analyze(
+            profile, results['status'], results['risk']
         )
         if verbose:
             print(f"   → 主要问题数: {len(results['factors'].get('main_problems', []))}")
 
-        # Stage 3.5: RAG 知识检索（可选 - 使用新的 KnowledgeAgent）
-        if self.knowledge_agent is not None:
-            if verbose:
-                print("📚 Stage 3.5: 知识检索 Agent 执行中...")
-            results['knowledge'] = self._run_stage(
-                "knowledge",
-                "正在检索知识库参考...",
-                "知识库参考检索完成",
-                lambda: self.knowledge_agent.retrieve_comprehensive(
-                    profile,
-                    results['status'],
-                    results['risk'],
-                    results['factors'],
-                    top_k=RAG_TOP_K,
-                ),
-                stage_callback,
-            )
-            knowledge_context = results['knowledge'].get('combined_context', '')
-            if verbose:
-                total_hits = results['knowledge'].get('total_hits', 0)
-                print(f"   → 总命中文档片段数: {total_hits}")
-                risk_hits = len(results['knowledge'].get('risk_prevention', {}).get('hits', []))
-                disease_hits = len(results['knowledge'].get('disease_management', {}).get('hits', []))
-                training_hits = len(results['knowledge'].get('functional_training', {}).get('hits', []))
-                if risk_hits > 0:
-                    print(f"   → 风险预防知识: {risk_hits}条")
-                if disease_hits > 0:
-                    print(f"   → 疾病管理知识: {disease_hits}条")
-                if training_hits > 0:
-                    print(f"   → 功能训练知识: {training_hits}条")
-        else:
-            results['knowledge'] = {
-                "enabled": False,
-                "risk_prevention": {"hits": [], "context": ""},
-                "disease_management": {"hits": [], "context": ""},
-                "functional_training": {"hits": [], "context": ""},
-                "combined_context": "",
-                "total_hits": 0
-            }
-        
-        # Stage 4: 行动计划生成（新增）
+        # Stage 4: 行动计划生成（V3）
         if verbose:
-            print("💡 Stage 4: 行动计划 Agent 执行中...")
-        results['actions'] = self._run_stage(
-            "actions",
-            "正在生成干预行动建议...",
-            "干预行动建议生成完成",
-            lambda: self.action_agent.generate(
-                profile,
-                results['status'],
-                results['risk'],
-                results['factors'],
-                knowledge_context=knowledge_context,
-            ),
-            stage_callback,
+            print("💡 Stage 4: 行动计划 Agent V3 执行中...")
+        results['actions'] = self.action_agent.generate(
+            profile, results['status'], results['risk'], results['factors']
         )
         if verbose:
             print(f"   → 生成行动数: {len(results['actions'].get('actions', []))}")
-        
-        # Stage 5: 优先级排序（新增）
+
+        # Stage 5: 优先级排序（V3）
         if verbose:
-            print("🎯 Stage 5: 优先级排序 Agent 执行中...")
-        results['priority'] = self._run_stage(
-            "priority",
-            "正在排序建议优先级...",
-            "建议优先级排序完成",
-            lambda: self.priority_agent.rank(
-                results['actions'].get('actions', []),
-                results['risk'],
-            ),
-            stage_callback,
+            print("🎯 Stage 5: 优先级排序 Agent V3 执行中...")
+        results['priority'] = self.priority_agent.rank(
+            results['actions'].get('actions', []),
+            results['risk']
         )
         if verbose:
             print(f"   → A级优先: {len(results['priority'].get('priority_a', []))}项")
             print(f"   → B级优先: {len(results['priority'].get('priority_b', []))}项")
             print(f"   → C级优先: {len(results['priority'].get('priority_c', []))}项")
-        
-        # Stage 6: 反思校验
+
+        # Stage 6: 反思校验（V3）
         if verbose:
-            print("✅ Stage 6: 反思校验 Agent 执行中...")
-        results['review'] = self._run_stage(
-            "review",
-            "正在进行结果复核...",
-            "结果复核完成",
-            lambda: self.review_agent.review(
-                results['status'],
-                results['risk'],
-                results['factors'],
-                results['actions'],
-                results['priority'],
-            ),
-            stage_callback,
+            print("✅ Stage 6: 反思校验 Agent V3 执行中...")
+        results['review'] = self.review_agent.review(
+            profile, results['status'], results['risk'],
+            results['factors'], results['actions'], results['priority']
         )
         if verbose:
             quality = results['review'].get('overall_quality', '未知')
             print(f"   → 报告质量: {quality}")
-        
+
         # Stage 7: 报告生成（V2）
         if verbose:
             print("📝 Stage 7: 报告生成 Agent V2 执行中...")
-        results['report'] = self._run_stage(
-            "report",
-            "正在整理最终报告文本...",
-            "最终报告文本整理完成",
-            lambda: self.report_agent.generate_report(
-                profile,
-                results['status'],
-                results['risk'],
-                results['factors'],
-                results['actions'],
-                results['priority'],
-                results['review'],
-                knowledge_context=knowledge_context,
-            ),
-            stage_callback,
+        results['report'] = self.report_agent.generate_report(
+            profile, results['status'], results['risk'],
+            results['factors'], results['actions'],
+            results['priority'], results['review']
         )
         if verbose:
             print("   → 报告生成完成")
-        
+
         return results
 
 
@@ -1271,22 +1045,22 @@ class OrchestratorAgentV2:
 def load_user_profile_from_excel(excel_path: str, row_index: int = 0) -> UserProfile:
     """
     从Excel文件加载用户数据并转换为UserProfile
-    
+
     参数:
         excel_path: Excel文件路径
         row_index: 数据行索引（注意：第0行是中文描述，实际数据从第1行开始）
     """
     print(f"正在加载数据: {excel_path}")
     df = pd.read_excel(excel_path)
-    
+
     # 第一行是中文描述，实际数据从第二行开始
     df_data = df.iloc[1:].reset_index(drop=True)
-    
+
     if row_index >= len(df_data):
         raise ValueError(f"行索引 {row_index} 超出数据范围（共{len(df_data)}行）")
-    
+
     row = df_data.iloc[row_index]
-    
+
     # 辅助函数：安全获取值
     def safe_get(col_name, default=None):
         if col_name in df_data.columns:
@@ -1295,7 +1069,7 @@ def load_user_profile_from_excel(excel_path: str, row_index: int = 0) -> UserPro
                 return default
             return str(val) if val is not None else default
         return default
-    
+
     # 构建UserProfile（基于prepare_sample_data.py中的变量映射）
     profile = UserProfile(
         # 人口学
@@ -1305,10 +1079,10 @@ def load_user_profile_from_excel(excel_path: str, row_index: int = 0) -> UserPro
         residence=safe_get('residenc'),
         education_years=safe_get('f1'),
         marital_status=safe_get('f41'),
-        
+
         # 健康限制
         health_limitation=safe_get('e0'),
-        
+
         # BADL (6项) - e1到e6
         badl_bathing=safe_get('e1'),
         badl_dressing=safe_get('e2'),
@@ -1316,7 +1090,7 @@ def load_user_profile_from_excel(excel_path: str, row_index: int = 0) -> UserPro
         badl_transferring=safe_get('e4'),
         badl_continence=safe_get('e5'),
         badl_eating=safe_get('e6'),
-        
+
         # IADL (8项) - e7到e14
         iadl_visiting=safe_get('e7'),
         iadl_shopping=safe_get('e8'),
@@ -1326,7 +1100,7 @@ def load_user_profile_from_excel(excel_path: str, row_index: int = 0) -> UserPro
         iadl_carrying=safe_get('e12'),
         iadl_crouching=safe_get('e13'),
         iadl_transport=safe_get('e14'),
-        
+
         # 慢性病
         hypertension=safe_get('g15a1'),
         diabetes=safe_get('g15b1'),
@@ -1335,7 +1109,7 @@ def load_user_profile_from_excel(excel_path: str, row_index: int = 0) -> UserPro
         cataract=safe_get('g15g1'),
         cancer=safe_get('g15i1'),
         arthritis=safe_get('g15n1'),
-        
+
         # 认知功能
         cognition_time=safe_get('c11'),
         cognition_month=safe_get('c12'),
@@ -1343,24 +1117,24 @@ def load_user_profile_from_excel(excel_path: str, row_index: int = 0) -> UserPro
         cognition_place=safe_get('c15'),
         cognition_calc=[safe_get('c31a', ''), safe_get('c31b', ''), safe_get('c31c', '')],
         cognition_draw=safe_get('c32'),
-        
+
         # 心理状态
         depression=safe_get('b33'),
         anxiety=safe_get('b36'),
         loneliness=safe_get('b38'),
-        
+
         # 生活方式
         smoking=safe_get('d71'),
         drinking=safe_get('d81'),
         exercise=safe_get('d91'),
         sleep_quality=safe_get('b310a'),
-        
+
         # 生理指标
         weight=safe_get('g101'),
         height=safe_get('g1021'),
         vision=safe_get('g1'),
         hearing=safe_get('g106'),
-        
+
         # 社会支持
         living_arrangement=safe_get('a51'),
         cohabitants=safe_get('a52'),
@@ -1368,35 +1142,35 @@ def load_user_profile_from_excel(excel_path: str, row_index: int = 0) -> UserPro
         income=safe_get('f35'),
         medical_insurance=f"城镇医保:{safe_get('f64e')}, 新农合:{safe_get('f64g')}",
         caregiver=safe_get('f5'),
-        
+
         user_type="elderly"
     )
-    
+
     return profile
 
 
 def load_multiple_profiles(excel_path: str, n_samples: int = 50, random_state: int = 42) -> List[UserProfile]:
     """
     从Excel文件加载多个用户数据
-    
+
     参数:
         excel_path: Excel文件路径
         n_samples: 抽样数量
         random_state: 随机种子
-    
+
     返回:
         UserProfile列表
     """
     import numpy as np
-    
+
     print(f"正在加载数据: {excel_path}")
     df = pd.read_excel(excel_path)
-    
+
     # 第一行是中文描述，实际数据从第二行开始
     df_data = df.iloc[1:].reset_index(drop=True)
-    
+
     print(f"数据加载完成，共 {len(df_data)} 条记录")
-    
+
     # 随机抽样
     np.random.seed(random_state)
     if n_samples < len(df_data):
@@ -1405,14 +1179,14 @@ def load_multiple_profiles(excel_path: str, n_samples: int = 50, random_state: i
     else:
         sample_indices = range(len(df_data))
         print(f"使用全部 {len(df_data)} 条数据")
-    
+
     # 加载所有样本
     profiles = []
     for idx in sample_indices:
         try:
             # 临时修改函数以支持已加载的DataFrame
             row = df_data.iloc[idx]
-            
+
             def safe_get(col_name, default=None):
                 if col_name in df_data.columns:
                     val = row[col_name]
@@ -1420,7 +1194,7 @@ def load_multiple_profiles(excel_path: str, n_samples: int = 50, random_state: i
                         return default
                     return str(val) if val is not None else default
                 return default
-            
+
             profile = UserProfile(
                 age=safe_get('trueage'),
                 sex=safe_get('a1'),
@@ -1479,7 +1253,7 @@ def load_multiple_profiles(excel_path: str, n_samples: int = 50, random_state: i
         except Exception as e:
             print(f"  ⚠️  加载第 {idx} 行数据失败: {str(e)}")
             continue
-    
+
     print(f"成功加载 {len(profiles)} 个用户画像")
     return profiles
 
@@ -1487,7 +1261,7 @@ def load_multiple_profiles(excel_path: str, n_samples: int = 50, random_state: i
 def save_results(results: Dict, profile: UserProfile, output_dir: str = "./output", row_index: int = None):
     """
     保存评估结果
-    
+
     参数:
         results: 评估结果
         profile: 用户画像
@@ -1495,15 +1269,15 @@ def save_results(results: Dict, profile: UserProfile, output_dir: str = "./outpu
         row_index: 数据行索引（可选，用于文件名标识）
     """
     os.makedirs(output_dir, exist_ok=True)
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+
     # 构建文件名：包含年龄、性别、时间戳，可选行号
     if row_index is not None:
         user_id = f"row{row_index}_{profile.age}岁{profile.sex}_{timestamp}"
     else:
         user_id = f"{profile.age}岁{profile.sex}_{timestamp}"
-    
+
     # 1. 保存完整JSON结果
     json_path = os.path.join(output_dir, f"result_{user_id}.json")
     with open(json_path, 'w', encoding='utf-8') as f:
@@ -1513,7 +1287,7 @@ def save_results(results: Dict, profile: UserProfile, output_dir: str = "./outpu
         if row_index is not None:
             results_copy['row_index'] = row_index
         json.dump(results_copy, f, ensure_ascii=False, indent=2)
-    
+
     # 2. 保存Markdown报告
     report_path = os.path.join(output_dir, f"report_{user_id}.md")
     with open(report_path, 'w', encoding='utf-8') as f:
@@ -1521,58 +1295,58 @@ def save_results(results: Dict, profile: UserProfile, output_dir: str = "./outpu
         if row_index is not None:
             f.write(f"<!-- 数据来源：第{row_index}行 -->\n\n")
         f.write(results['report'])
-    
+
     print(f"\n✅ 结果已保存：")
     print(f"   - JSON: {json_path}")
     print(f"   - 报告: {report_path}")
-    
+
     return json_path, report_path
 
 
 # ============ 批量处理工具 ============
-def batch_process(profiles: List[UserProfile], output_dir: str = "./output", 
+def batch_process(profiles: List[UserProfile], output_dir: str = "./output",
                   verbose: bool = False, save_reports: bool = True) -> List[Dict]:
     """
     批量处理多个用户画像
-    
+
     参数:
         profiles: UserProfile列表
         output_dir: 输出目录
         verbose: 是否显示详细过程
         save_reports: 是否保存报告
-    
+
     返回:
         所有评估结果的列表
     """
     os.makedirs(output_dir, exist_ok=True)
-    
+
     orchestrator = OrchestratorAgentV2()
     all_results = []
-    
+
     print(f"\n开始批量处理 {len(profiles)} 个用户...")
     print("=" * 60)
-    
+
     for i, profile in enumerate(profiles):
         print(f"\n处理第 {i+1}/{len(profiles)} 个用户...")
         print(f"用户信息: {profile.age}岁 {profile.sex}")
-        
+
         try:
             # 运行评估
             results = orchestrator.run(profile, verbose=verbose)
-            
+
             # 保存结果
             if save_reports:
                 save_results(results, profile, output_dir=output_dir)
-            
+
             all_results.append({
                 'index': i,
                 'profile': asdict(profile),
                 'results': results,
                 'success': True
             })
-            
+
             print(f"✅ 第 {i+1} 个用户评估完成")
-            
+
         except Exception as e:
             print(f"❌ 第 {i+1} 个用户评估失败: {str(e)}")
             all_results.append({
@@ -1581,7 +1355,7 @@ def batch_process(profiles: List[UserProfile], output_dir: str = "./output",
                 'error': str(e),
                 'success': False
             })
-    
+
     # 统计结果
     success_count = sum(1 for r in all_results if r['success'])
     print("\n" + "=" * 60)
@@ -1589,7 +1363,7 @@ def batch_process(profiles: List[UserProfile], output_dir: str = "./output",
     print(f"成功: {success_count}/{len(profiles)}")
     print(f"失败: {len(profiles) - success_count}/{len(profiles)}")
     print("=" * 60)
-    
+
     # 保存汇总结果
     summary_path = os.path.join(output_dir, 'batch_summary.json')
     with open(summary_path, 'w', encoding='utf-8') as f:
@@ -1602,110 +1376,110 @@ def batch_process(profiles: List[UserProfile], output_dir: str = "./output",
             summary.append(r_copy)
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(f"汇总结果已保存: {summary_path}")
-    
+
     return all_results
 
 
 # ============ 主程序入口 ============
 def main():
     """主程序入口 - 演示如何使用系统"""
-    
+
     print("=" * 80)
     print("AI 养老健康多 Agent 协作系统 V2.0")
     print("健康评估与照护行动计划生成系统")
     print("=" * 80)
-    
+
     # 数据文件路径
     EXCEL_PATH = '../data/clhls_2018_bilingual_headers-checked.xlsx'
     OUTPUT_DIR = '../data/output_v2'
-    
+
     # 检查文件是否存在
     if not os.path.exists(EXCEL_PATH):
         print(f"\n❌ 数据文件不存在: {EXCEL_PATH}")
         print("请检查文件路径")
         return
-    
+
     # 用户选择运行模式
     print("\n请选择运行模式：")
     print("1. 单个样本测试（快速验证）")
     print("2. 批量处理50条数据（完整评估）")
     print("3. 自定义数量")
-    
+
     choice = input("\n请输入选项 (1/2/3，默认为1): ").strip() or "1"
-    
+
     if choice == "1":
         # 模式1：单个样本测试
         print("\n【模式1：单个样本测试】")
         print("=" * 60)
-        
+
         try:
             profile = load_user_profile_from_excel(EXCEL_PATH, row_index=0)
             print(f"✅ 成功加载用户数据：{profile.age}岁 {profile.sex}")
-            
+
             # 创建调度中心并运行
             orchestrator = OrchestratorAgentV2()
             results = orchestrator.run(profile, verbose=True)
-            
+
             # 保存结果
             save_results(results, profile, output_dir=OUTPUT_DIR)
-            
+
             print("\n" + "=" * 60)
             print("✅ 评估完成！")
             print("=" * 60)
-            
+
         except Exception as e:
             print(f"❌ 评估失败: {str(e)}")
             import traceback
             traceback.print_exc()
-    
+
     elif choice == "2":
         # 模式2：批量处理50条
         print("\n【模式2：批量处理50条数据】")
         print("=" * 60)
-        
+
         try:
             profiles = load_multiple_profiles(EXCEL_PATH, n_samples=50, random_state=42)
-            
+
             # 批量处理
             all_results = batch_process(
-                profiles, 
+                profiles,
                 output_dir=OUTPUT_DIR,
                 verbose=False,  # 批量处理时不显示详细过程
                 save_reports=True
             )
-            
+
             print("\n✅ 批量处理完成！")
-            
+
         except Exception as e:
             print(f"❌ 批量处理失败: {str(e)}")
             import traceback
             traceback.print_exc()
-    
+
     elif choice == "3":
         # 模式3：自定义数量
         n_samples = int(input("\n请输入要处理的样本数量: ").strip())
-        
+
         print(f"\n【模式3：批量处理{n_samples}条数据】")
         print("=" * 60)
-        
+
         try:
             profiles = load_multiple_profiles(EXCEL_PATH, n_samples=n_samples, random_state=42)
-            
+
             # 批量处理
             all_results = batch_process(
-                profiles, 
+                profiles,
                 output_dir=OUTPUT_DIR,
                 verbose=False,
                 save_reports=True
             )
-            
+
             print("\n✅ 批量处理完成！")
-            
+
         except Exception as e:
             print(f"❌ 批量处理失败: {str(e)}")
             import traceback
             traceback.print_exc()
-    
+
     else:
         print("❌ 无效的选项")
 
@@ -1715,7 +1489,7 @@ def test_single_sample():
     print("=" * 60)
     print("快速测试模式")
     print("=" * 60)
-    
+
     # 创建测试用户
     test_profile = UserProfile(
         age=85,
@@ -1724,10 +1498,10 @@ def test_single_sample():
         residence="农村",
         education_years=0,
         marital_status="丧偶",
-        
+
         # 健康限制
         health_limitation="是，有些限制",
-        
+
         # BADL - 基本自理
         badl_bathing="不需要帮助",
         badl_dressing="不需要帮助",
@@ -1735,7 +1509,7 @@ def test_single_sample():
         badl_transferring="不需要帮助",
         badl_continence="不需要帮助",
         badl_eating="不需要帮助",
-        
+
         # IADL - 部分困难
         iadl_visiting="能",
         iadl_shopping="有点困难",
@@ -1745,55 +1519,55 @@ def test_single_sample():
         iadl_carrying="不能做",
         iadl_crouching="不能做",
         iadl_transport="不能做",
-        
+
         # 慢性病
         hypertension="否",
         diabetes="否",
         heart_disease="是",
         stroke="否",
         arthritis="是",
-        
+
         # 认知功能
         cognition_time="正确",
         cognition_month="正确",
         cognition_season="正确",
         cognition_place="正确",
         cognition_calc=["正确", "正确", "错误"],
-        
+
         # 心理状态
         depression="有时",
         anxiety="很少",
         loneliness="有时",
-        
+
         # 生活方式
         smoking="从不",
         drinking="从不",
         exercise="有时",
         sleep_quality="一般",
-        
+
         # 生理指标
         weight=50,
         height=155,
         vision="一般",
         hearing="好",
-        
+
         # 社会支持
         living_arrangement="与子女同住",
         cohabitants=3,
         medical_insurance="城乡居民医保",
         caregiver="子女",
         financial_status="一般",
-        
+
         user_type="elderly"
     )
-    
+
     # 创建调度中心并运行
     orchestrator = OrchestratorAgentV2()
     results = orchestrator.run(test_profile, verbose=True)
-    
+
     # 保存结果
     save_results(results, test_profile, output_dir="../data/output_v2_test")
-    
+
     print("\n✅ 测试完成！")
     return results
 
