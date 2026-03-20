@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import api.server as server
+import multi_agent_system_v2 as workflow
 from tests.api_flows.support import APIFlowTestCase, build_fake_workflow_results
 
 
@@ -192,6 +195,89 @@ class ElderlyApiFlowTestCase(APIFlowTestCase):
         self.assertTrue((self.workspace_dir / session_id / f"{expected_stem}.md").exists())
         self.assertTrue(any(self.reports_dir.rglob(f"{expected_stem}.json")))
         self.assertTrue(any(self.reports_dir.rglob(f"{expected_stem}.md")))
+
+    def test_report_stream_emits_real_stage_events(self):
+        start = self._start_chat()
+        session_id = start["sessionId"]
+        elderly_token = start["accessToken"]
+
+        def fake_run(profile, verbose=False, stage_callback=None):
+            sequence = [
+                ("status", "正在判定功能状态...", "功能状态判定完成"),
+                ("risk", "正在进行风险预测...", "风险预测完成"),
+                ("factors", "正在提取关键影响因素...", "关键影响因素分析完成"),
+                ("actions", "正在生成干预行动建议...", "干预行动建议生成完成"),
+                ("priority", "正在排序建议优先级...", "建议优先级排序完成"),
+                ("review", "正在进行结果复核...", "结果复核完成"),
+                ("report", "正在整理最终报告文本...", "最终报告文本整理完成"),
+            ]
+            for agent, running_message, completed_message in sequence:
+                if stage_callback is not None:
+                    stage_callback({"agent": agent, "status": "running", "message": running_message})
+                    stage_callback({"agent": agent, "status": "completed", "message": completed_message})
+            return build_fake_workflow_results()
+
+        with patch.object(self.conversation_manager.orchestrator, "run", side_effect=fake_run):
+            with self.client.stream(
+                "POST",
+                "/report/stream",
+                json={
+                    "sessionId": session_id,
+                    "profile": {"age": 82, "sex": "男", "residence": "城市"},
+                },
+                headers=self._auth_headers(elderly_token),
+            ) as response:
+                self.assertEqual(response.status_code, 200)
+                raw_body = "".join(response.iter_text())
+
+        stage_events = []
+        for line in raw_body.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            payload = json.loads(line[6:])
+            if payload.get("type") == "agent_status":
+                stage_events.append(payload["data"])
+
+        self.assertIn(
+            {"agent": "status", "status": "running", "message": "正在判定功能状态..."},
+            stage_events,
+        )
+        self.assertIn(
+            {"agent": "report", "status": "completed", "message": "最终报告文本整理完成"},
+            stage_events,
+        )
+
+        ordered_running_agents = [
+            event["agent"]
+            for event in stage_events
+            if event["status"] == "running" and event["agent"] != "orchestrator"
+        ]
+        self.assertEqual(
+            ordered_running_agents,
+            ["status", "risk", "factors", "actions", "priority", "review", "report"],
+        )
+
+    def test_llm_call_retries_after_connection_error(self):
+        agent = workflow.BaseAgent("RetryAgent", "你是测试助手。")
+        attempts = {"count": 0}
+
+        def fake_create(**kwargs):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("Connection error.")
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="重试成功")
+                    )
+                ]
+            )
+
+        with patch.object(workflow.client.chat.completions, "create", side_effect=fake_create):
+            content = agent.call_llm("请返回测试结果")
+
+        self.assertEqual(content, "重试成功")
+        self.assertEqual(attempts["count"], 2)
 
     def test_elderly_can_delete_own_session_workspace(self):
         start = self._start_chat()

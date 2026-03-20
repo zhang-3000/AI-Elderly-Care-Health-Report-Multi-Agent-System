@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -71,6 +72,9 @@ from security import (
     require_state,
 )
 from workspace_manager import WorkspaceManager
+
+
+logger = logging.getLogger(__name__)
 
 try:
     from services.google_stt_stream import (
@@ -276,8 +280,14 @@ def _save_generated_chat_report_if_needed(
 async def _run_report_workflow(
     conversation_manager: ConversationManager,
     profile,
+    stage_callback=None,
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(conversation_manager.orchestrator.run, profile, False)
+    return await asyncio.to_thread(
+        conversation_manager.orchestrator.run,
+        profile,
+        False,
+        stage_callback,
+    )
 
 
 def _visible_user_ids_for_actor(request: Request, actor) -> Optional[set[str]]:
@@ -700,6 +710,8 @@ async def stream_report(request: Request, payload: ReportGenerateRequest):
         try:
             profile = to_backend_profile(payload.profile)
             profile_dict = profile_to_dict(profile)
+            loop = asyncio.get_running_loop()
+            stage_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
 
             start_event = AgentStatusEvent(
                 agent="orchestrator",
@@ -708,75 +720,60 @@ async def stream_report(request: Request, payload: ReportGenerateRequest):
             )
             yield f"data: {json.dumps({'type': 'agent_status', 'data': start_event.model_dump()})}\n\n"
 
-            workflow_task = asyncio.create_task(_run_report_workflow(conversation_manager, profile))
+            def stage_callback(event: Dict[str, Any]) -> None:
+                loop.call_soon_threadsafe(stage_queue.put_nowait, event)
 
-            agent_stages = ["status", "risk", "factors"]
-            if RAG_ENABLED:
-                agent_stages.append("knowledge")
-            agent_stages.extend(["actions", "priority", "review", "report"])
-            stage_messages = {
-                "status": "正在判定功能状态...",
-                "risk": "正在进行风险预测...",
-                "factors": "正在提取关键影响因素...",
-                "knowledge": "正在检索知识库参考...",
-                "actions": "正在生成干预行动建议...",
-                "priority": "正在排序建议优先级...",
-                "review": "正在进行结果复核...",
-                "report": "正在整理最终报告文本...",
-            }
-
-            stage_idx = 0
-            stage_start_ts = datetime.now()
-            stage_switch_seconds = 6
+            workflow_task = asyncio.create_task(
+                _run_report_workflow(conversation_manager, profile, stage_callback=stage_callback)
+            )
+            current_stage: Optional[str] = None
+            current_stage_message: Optional[str] = None
+            current_stage_started_at: Optional[datetime] = None
             heartbeat_seconds = 1.2
 
-            current_stage = agent_stages[stage_idx]
-            initial_event = AgentStatusEvent(
-                agent=current_stage,
-                status="running",
-                message=stage_messages[current_stage],
-            )
-            yield f"data: {json.dumps({'type': 'agent_status', 'data': initial_event.model_dump()})}\n\n"
+            while True:
+                if workflow_task.done() and stage_queue.empty():
+                    break
 
-            while not workflow_task.done():
-                await asyncio.sleep(heartbeat_seconds)
-                elapsed = (datetime.now() - stage_start_ts).total_seconds()
-                next_stage_threshold = (stage_idx + 1) * stage_switch_seconds
+                try:
+                    stage_event_payload = await asyncio.wait_for(
+                        stage_queue.get(),
+                        timeout=heartbeat_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    if workflow_task.done():
+                        break
+                    if current_stage and current_stage_message and current_stage_started_at is not None:
+                        elapsed = int((datetime.now() - current_stage_started_at).total_seconds())
+                        heartbeat_event = AgentStatusEvent(
+                            agent=current_stage,
+                            status="running",
+                            message=f"{current_stage_message}（已运行 {elapsed} 秒）",
+                        )
+                        yield f"data: {json.dumps({'type': 'agent_status', 'data': heartbeat_event.model_dump()})}\n\n"
+                    continue
 
-                if stage_idx < len(agent_stages) - 1 and elapsed >= next_stage_threshold:
-                    finished_stage = agent_stages[stage_idx]
-                    completed_event = AgentStatusEvent(
-                        agent=finished_stage,
-                        status="completed",
-                        message=f"{finished_stage} 阶段完成",
-                    )
-                    yield f"data: {json.dumps({'type': 'agent_status', 'data': completed_event.model_dump()})}\n\n"
-
-                    stage_idx += 1
-                    current_stage = agent_stages[stage_idx]
-                    running_event = AgentStatusEvent(
-                        agent=current_stage,
-                        status="running",
-                        message=stage_messages[current_stage],
-                    )
-                    yield f"data: {json.dumps({'type': 'agent_status', 'data': running_event.model_dump()})}\n\n"
-                else:
-                    heartbeat_event = AgentStatusEvent(
-                        agent=agent_stages[stage_idx],
-                        status="running",
-                        message=f"{stage_messages[agent_stages[stage_idx]]}（已运行 {int(elapsed)} 秒）",
-                    )
-                    yield f"data: {json.dumps({'type': 'agent_status', 'data': heartbeat_event.model_dump()})}\n\n"
+                stage_event = AgentStatusEvent(
+                    agent=str(stage_event_payload.get("agent") or "unknown"),
+                    status=str(stage_event_payload.get("status") or "unknown"),
+                    message=str(stage_event_payload.get("message") or ""),
+                )
+                logger.info(
+                    "Report stream stage event session_id=%s stage=%s status=%s message=%s",
+                    payload.sessionId,
+                    stage_event.agent,
+                    stage_event.status,
+                    stage_event.message,
+                )
+                if stage_event.status == "running":
+                    current_stage = stage_event.agent
+                    current_stage_message = stage_event.message
+                    current_stage_started_at = datetime.now()
+                elif stage_event.status in {"completed", "failed"} and stage_event.agent == current_stage:
+                    current_stage_message = stage_event.message
+                yield f"data: {json.dumps({'type': 'agent_status', 'data': stage_event.model_dump()})}\n\n"
 
             results = await workflow_task
-
-            done_stage = agent_stages[stage_idx]
-            final_stage_event = AgentStatusEvent(
-                agent=done_stage,
-                status="completed",
-                message=f"{done_stage} 阶段完成",
-            )
-            yield f"data: {json.dumps({'type': 'agent_status', 'data': final_stage_event.model_dump()})}\n\n"
 
             report_data = to_frontend_report_data(results)
             save_report_bundle(
@@ -805,6 +802,7 @@ async def stream_report(request: Request, payload: ReportGenerateRequest):
             yield f"data: {json.dumps({'type': 'complete', 'data': report_data})}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as exc:
+            logger.exception("Report stream failed for session_id=%s", payload.sessionId)
             error_data = json.dumps({"type": "error", "data": {"message": str(exc)}})
             yield f"data: {error_data}\n\n"
 

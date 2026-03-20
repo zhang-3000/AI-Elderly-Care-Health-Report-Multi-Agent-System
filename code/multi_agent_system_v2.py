@@ -11,10 +11,12 @@ AI 养老健康多 Agent 协作系统 V2.0
 """
 
 import json
+import logging
 import pandas as pd
 import os
 from openai import OpenAI
-from typing import Dict, Any, List, Optional
+import time
+from typing import Callable, Dict, Any, List, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +37,7 @@ for key in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy
         del os.environ[key]
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+logger = logging.getLogger(__name__)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -42,6 +45,31 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+LLM_TIMEOUT_SECONDS = max(_env_float("DEEPSEEK_TIMEOUT_SECONDS", 180.0), 1.0)
+LLM_MAX_RETRIES = max(_env_int("DEEPSEEK_MAX_RETRIES", 2), 0)
+LLM_RETRY_DELAY_SECONDS = max(_env_float("DEEPSEEK_RETRY_DELAY_SECONDS", 2.0), 0.0)
 
 
 RAG_ENABLED = _env_flag("RAG_ENABLED", False)
@@ -135,22 +163,79 @@ class BaseAgent:
         self.name = name
         self.system_prompt = system_prompt
         self.knowledge_agent = knowledge_agent  # 可选的知识检索能力
+
+    @staticmethod
+    def _is_retryable_error(error: Exception) -> bool:
+        error_name = error.__class__.__name__.lower()
+        error_text = str(error).lower()
+        retry_markers = (
+            "connection",
+            "timeout",
+            "timed out",
+            "rate limit",
+            "temporarily unavailable",
+            "server disconnected",
+            "502",
+            "503",
+            "504",
+        )
+        return (
+            "connection" in error_name
+            or "timeout" in error_name
+            or any(marker in error_text for marker in retry_markers)
+        )
     
     def call_llm(self, user_prompt: str, temperature: float = 0.3) -> str:
         """调用 LLM"""
-        try:
-            response = client.chat.completions.create(
-                model=DEEPSEEK_MODEL,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=temperature,
-                max_tokens=2000
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            return f"Error: {str(e)}"
+        total_attempts = LLM_MAX_RETRIES + 1
+        for attempt in range(1, total_attempts + 1):
+            started_at = time.monotonic()
+            try:
+                logger.info(
+                    "[%s] LLM request started attempt=%s/%s model=%s prompt_chars=%s timeout=%.1fs",
+                    self.name,
+                    attempt,
+                    total_attempts,
+                    DEEPSEEK_MODEL,
+                    len(user_prompt),
+                    LLM_TIMEOUT_SECONDS,
+                )
+                response = client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=temperature,
+                    max_tokens=2000,
+                    timeout=LLM_TIMEOUT_SECONDS,
+                )
+                duration = time.monotonic() - started_at
+                logger.info(
+                    "[%s] LLM request finished attempt=%s/%s duration=%.2fs",
+                    self.name,
+                    attempt,
+                    total_attempts,
+                    duration,
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as error:
+                duration = time.monotonic() - started_at
+                retryable = attempt < total_attempts and self._is_retryable_error(error)
+                logger.warning(
+                    "[%s] LLM request failed attempt=%s/%s duration=%.2fs retryable=%s error=%s",
+                    self.name,
+                    attempt,
+                    total_attempts,
+                    duration,
+                    retryable,
+                    error,
+                )
+                if not retryable:
+                    raise
+                sleep_seconds = LLM_RETRY_DELAY_SECONDS * attempt
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
     
     def call_llm_with_rag(
         self, 
@@ -955,8 +1040,66 @@ class OrchestratorAgentV2:
         except Exception as error:
             print(f"⚠️ Knowledge Agent 初始化失败: {error}")
             return None
+
+    @staticmethod
+    def _emit_stage_event(
+        stage_callback: Optional[Callable[[Dict[str, Any]], None]],
+        agent: str,
+        status: str,
+        message: str,
+        duration_seconds: Optional[float] = None,
+    ) -> None:
+        if stage_callback is None:
+            return
+        payload: Dict[str, Any] = {
+            "agent": agent,
+            "status": status,
+            "message": message,
+        }
+        if duration_seconds is not None:
+            payload["duration_seconds"] = round(duration_seconds, 2)
+        stage_callback(payload)
+
+    def _run_stage(
+        self,
+        stage_key: str,
+        running_message: str,
+        completed_message: str,
+        func: Callable[[], Any],
+        stage_callback: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> Any:
+        self._emit_stage_event(stage_callback, stage_key, "running", running_message)
+        started_at = time.monotonic()
+        try:
+            result = func()
+        except Exception as error:
+            duration = time.monotonic() - started_at
+            logger.exception("Orchestrator stage failed: %s", stage_key)
+            self._emit_stage_event(
+                stage_callback,
+                stage_key,
+                "failed",
+                f"{running_message}失败: {error}",
+                duration_seconds=duration,
+            )
+            raise
+
+        duration = time.monotonic() - started_at
+        self._emit_stage_event(
+            stage_callback,
+            stage_key,
+            "completed",
+            completed_message,
+            duration_seconds=duration,
+        )
+        return result
     
-    def run(self, profile: UserProfile, verbose: bool = True) -> Dict:
+    def run(
+        self,
+        profile: UserProfile,
+        verbose: bool = True,
+        stage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict:
         """执行完整评估流程"""
         results = {}
         knowledge_context = ""
@@ -964,7 +1107,13 @@ class OrchestratorAgentV2:
         # Stage 1: 状态判定
         if verbose:
             print("🔍 Stage 1: 状态判定 Agent 执行中...")
-        results['status'] = self.status_agent.judge(profile)
+        results['status'] = self._run_stage(
+            "status",
+            "正在判定功能状态...",
+            "功能状态判定完成",
+            lambda: self.status_agent.judge(profile),
+            stage_callback,
+        )
         if verbose:
             print(f"   → 状态: {results['status'].get('status_name', '未知')}")
         
@@ -972,7 +1121,13 @@ class OrchestratorAgentV2:
         if verbose:
             print("📈 Stage 2: 风险预测 Agent V2 执行中...")
         current_status = results['status'].get('status', 0)
-        results['risk'] = self.risk_agent.predict(profile, current_status)
+        results['risk'] = self._run_stage(
+            "risk",
+            "正在进行风险预测...",
+            "风险预测完成",
+            lambda: self.risk_agent.predict(profile, current_status),
+            stage_callback,
+        )
         if verbose:
             print(f"   → 风险等级: {results['risk'].get('overall_risk_level', '未知')}")
             print(f"   → 短期风险数: {len(results['risk'].get('short_term_risks', []))}")
@@ -980,8 +1135,12 @@ class OrchestratorAgentV2:
         # Stage 3: 因素分析（V2）
         if verbose:
             print("🔬 Stage 3: 因素分析 Agent V2 执行中...")
-        results['factors'] = self.factor_agent.analyze(
-            profile, results['status'], results['risk']
+        results['factors'] = self._run_stage(
+            "factors",
+            "正在提取关键影响因素...",
+            "关键影响因素分析完成",
+            lambda: self.factor_agent.analyze(profile, results['status'], results['risk']),
+            stage_callback,
         )
         if verbose:
             print(f"   → 主要问题数: {len(results['factors'].get('main_problems', []))}")
@@ -990,12 +1149,18 @@ class OrchestratorAgentV2:
         if self.knowledge_agent is not None:
             if verbose:
                 print("📚 Stage 3.5: 知识检索 Agent 执行中...")
-            results['knowledge'] = self.knowledge_agent.retrieve_comprehensive(
-                profile,
-                results['status'],
-                results['risk'],
-                results['factors'],
-                top_k=RAG_TOP_K,
+            results['knowledge'] = self._run_stage(
+                "knowledge",
+                "正在检索知识库参考...",
+                "知识库参考检索完成",
+                lambda: self.knowledge_agent.retrieve_comprehensive(
+                    profile,
+                    results['status'],
+                    results['risk'],
+                    results['factors'],
+                    top_k=RAG_TOP_K,
+                ),
+                stage_callback,
             )
             knowledge_context = results['knowledge'].get('combined_context', '')
             if verbose:
@@ -1023,9 +1188,18 @@ class OrchestratorAgentV2:
         # Stage 4: 行动计划生成（新增）
         if verbose:
             print("💡 Stage 4: 行动计划 Agent 执行中...")
-        results['actions'] = self.action_agent.generate(
-            profile, results['status'], results['risk'], results['factors'],
-            knowledge_context=knowledge_context,
+        results['actions'] = self._run_stage(
+            "actions",
+            "正在生成干预行动建议...",
+            "干预行动建议生成完成",
+            lambda: self.action_agent.generate(
+                profile,
+                results['status'],
+                results['risk'],
+                results['factors'],
+                knowledge_context=knowledge_context,
+            ),
+            stage_callback,
         )
         if verbose:
             print(f"   → 生成行动数: {len(results['actions'].get('actions', []))}")
@@ -1033,9 +1207,15 @@ class OrchestratorAgentV2:
         # Stage 5: 优先级排序（新增）
         if verbose:
             print("🎯 Stage 5: 优先级排序 Agent 执行中...")
-        results['priority'] = self.priority_agent.rank(
-            results['actions'].get('actions', []),
-            results['risk']
+        results['priority'] = self._run_stage(
+            "priority",
+            "正在排序建议优先级...",
+            "建议优先级排序完成",
+            lambda: self.priority_agent.rank(
+                results['actions'].get('actions', []),
+                results['risk'],
+            ),
+            stage_callback,
         )
         if verbose:
             print(f"   → A级优先: {len(results['priority'].get('priority_a', []))}项")
@@ -1045,9 +1225,18 @@ class OrchestratorAgentV2:
         # Stage 6: 反思校验
         if verbose:
             print("✅ Stage 6: 反思校验 Agent 执行中...")
-        results['review'] = self.review_agent.review(
-            results['status'], results['risk'],
-            results['factors'], results['actions'], results['priority']
+        results['review'] = self._run_stage(
+            "review",
+            "正在进行结果复核...",
+            "结果复核完成",
+            lambda: self.review_agent.review(
+                results['status'],
+                results['risk'],
+                results['factors'],
+                results['actions'],
+                results['priority'],
+            ),
+            stage_callback,
         )
         if verbose:
             quality = results['review'].get('overall_quality', '未知')
@@ -1056,11 +1245,21 @@ class OrchestratorAgentV2:
         # Stage 7: 报告生成（V2）
         if verbose:
             print("📝 Stage 7: 报告生成 Agent V2 执行中...")
-        results['report'] = self.report_agent.generate_report(
-            profile, results['status'], results['risk'],
-            results['factors'], results['actions'],
-            results['priority'], results['review'],
-            knowledge_context=knowledge_context,
+        results['report'] = self._run_stage(
+            "report",
+            "正在整理最终报告文本...",
+            "最终报告文本整理完成",
+            lambda: self.report_agent.generate_report(
+                profile,
+                results['status'],
+                results['risk'],
+                results['factors'],
+                results['actions'],
+                results['priority'],
+                results['review'],
+                knowledge_context=knowledge_context,
+            ),
+            stage_callback,
         )
         if verbose:
             print("   → 报告生成完成")
