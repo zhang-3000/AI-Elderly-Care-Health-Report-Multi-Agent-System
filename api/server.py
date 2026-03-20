@@ -31,6 +31,7 @@ from starlette.websockets import WebSocketState
 code_dir = Path(__file__).parent.parent / "code"
 api_dir = Path(__file__).parent
 core_dir = Path(__file__).parent.parent / "core"
+base_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(code_dir))
 sys.path.insert(0, str(api_dir))
 sys.path.insert(0, str(core_dir))
@@ -88,8 +89,19 @@ except Exception as exc:  # pragma: no cover - optional dependency
         """Google STT 不可用时的占位异常。"""
 
 
-DB_PATH = "/tmp/elderly-care-db/users.db"
-REPORTS_DIR = Path(__file__).parent.parent / "data" / "reports"
+def _resolve_project_path(env_name: str, default_relative_path: str) -> Path:
+    raw_value = (os.getenv(env_name) or "").strip()
+    if not raw_value:
+        return base_dir / default_relative_path
+
+    candidate = Path(raw_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+    return candidate
+
+
+DB_PATH = str(_resolve_project_path("DB_PATH", "data/users.db"))
+REPORTS_DIR = base_dir / "data" / "reports"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 RAG_ENABLED = os.getenv("RAG_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
 
