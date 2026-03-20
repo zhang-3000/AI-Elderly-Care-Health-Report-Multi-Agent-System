@@ -30,6 +30,7 @@ data/*.xls
 # 模型运行输出（结果可本地保存，不上传）
 data/output_v2_*/
 data/output_chat/
+data/reports/
 
 # uv 安装的临时 wheel 包（如 =0.1.0 这类）
 =*/
