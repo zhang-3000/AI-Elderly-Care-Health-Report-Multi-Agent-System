@@ -137,8 +137,16 @@ def _is_positive(value: Any) -> bool:
 def _is_limited(value: Any) -> bool:
     """判断功能项是否受限（非完全自理）。"""
     s = str(value).strip()
-    # 常见值: "1"=自理, "2"=有些困难, "3"=完全不能
-    return s in {"2", "3", "有些困难", "很困难", "完全不能做"}
+    # 数字编码: "2"=有些困难, "3"=完全不能
+    if s in {"2", "3"}:
+        return True
+    # 明确正常的值
+    normal_values = {"不需要帮助", "能", "自己做", "1", "不需要", "无困难"}
+    if s in normal_values:
+        return False
+    # 文本值: 各种"困难"的表述（注意排除"不需要帮助"）
+    limited_keywords = ("困难", "做不了", "费劲", "完全不能")
+    return any(kw in s for kw in limited_keywords)
 
 
 def extract_profile_elements(profile: Dict[str, Any]) -> List[str]:
@@ -186,18 +194,28 @@ def extract_profile_elements(profile: Dict[str, Any]) -> List[str]:
     # 心理状态
     depression = profile.get("depression")
     loneliness = profile.get("loneliness")
-    if depression and _is_positive(depression):
-        elements.append("有抑郁倾向")
-    if loneliness and _is_positive(loneliness):
-        elements.append("感到孤独")
+    if depression:
+        ds = str(depression).strip()
+        if ds in {"是", "有", "1", "true", "经常", "总是", "有时"}:
+            elements.append("有抑郁倾向")
+    if loneliness:
+        ls = str(loneliness).strip()
+        if ls in {"是", "有", "1", "true", "经常", "总是", "有时"}:
+            elements.append("感到孤独")
 
     # 视力/听力
     vision = profile.get("vision")
     hearing = profile.get("hearing")
-    if vision and _is_limited(vision):
-        elements.append("视力受损")
-    if hearing and _is_limited(hearing):
-        elements.append("听力受损")
+    if vision:
+        vs = str(vision).strip()
+        # "能看见并区分" 表示正常；其他值表示有问题
+        if vs not in {"能看见并区分", "1", "正常"} and vs not in {"", "None"}:
+            elements.append("视力受损")
+    if hearing:
+        hs = str(hearing).strip()
+        # hearing="否" 在 CLHLS 中表示听力不好（问的是"能否听清"）
+        if hs in {"否", "2", "3", "不能", "不好", "差", "听不清"}:
+            elements.append("听力受损")
 
     # 生活习惯
     smoking = profile.get("smoking")
@@ -212,11 +230,24 @@ def extract_profile_elements(profile: Dict[str, Any]) -> List[str]:
     return elements
 
 
-def build_retrieved_context_text(knowledge: Dict[str, Any]) -> str:
+def build_retrieved_context_text(
+    knowledge: Dict[str, Any],
+    use_full_text: bool = False,
+) -> str:
     """
-    从 results['knowledge'] 中提取完整的检索上下文文本。
-    优先使用 hits 中的 text 字段（完整文本），回退到 excerpt。
+    从 results['knowledge'] 中提取检索上下文文本。
+
+    Args:
+        knowledge: results['knowledge'] 字典
+        use_full_text: True 使用 chunk 完整 text（适合 Faithfulness 深度验证），
+                       False 使用 excerpt（适合 Context Relevance 精准度评估，
+                       也与 LLM 实际看到的上下文一致）。
     """
+    # 优先使用 combined_context（已由 KnowledgeAgent 格式化好的上下文）
+    combined = knowledge.get("combined_context", "")
+    if combined and not use_full_text:
+        return combined
+
     texts: List[str] = []
     categories = ["risk_prevention", "disease_management", "functional_training"]
 
@@ -224,8 +255,10 @@ def build_retrieved_context_text(knowledge: Dict[str, Any]) -> str:
         cat_data = knowledge.get(category, {})
         hits = cat_data.get("hits", [])
         for hit in hits:
-            # 优先使用完整 text，回退到 excerpt
-            content = hit.get("text") or hit.get("excerpt", "")
+            if use_full_text:
+                content = hit.get("text") or hit.get("excerpt", "")
+            else:
+                content = hit.get("excerpt", "")
             if content:
                 source = hit.get("doc_name", "未知文档")
                 title = hit.get("title", "")

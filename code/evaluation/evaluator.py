@@ -98,16 +98,20 @@ class ReportEvaluator:
         """
         report_text = results.get("report", "")
         knowledge = results.get("knowledge", {})
-        retrieved_context = build_retrieved_context_text(knowledge)
+
+        # Faithfulness 用完整 text 做深度验证
+        full_context = build_retrieved_context_text(knowledge, use_full_text=True)
+        # Context Relevance 用 excerpt/combined_context（与 LLM 实际看到的一致）
+        short_context = build_retrieved_context_text(knowledge, use_full_text=False)
 
         eval_result = EvaluationResult()
 
         # Faithfulness - 需要检索上下文
         if run_faithfulness:
-            if retrieved_context:
+            if full_context:
                 logger.info("开始评测 Faithfulness...")
                 eval_result.faithfulness = self.faithfulness_metric.evaluate(
-                    report_text, retrieved_context
+                    report_text, full_context
                 )
                 logger.info(
                     "Faithfulness 得分: %.4f (%d/%d)",
@@ -133,14 +137,13 @@ class ReportEvaluator:
 
         # Context Relevance - 需要检索上下文
         if run_context_relevance:
-            if retrieved_context:
-                # 构造查询描述
+            if short_context:
                 age = profile.get("age", "")
                 sex = profile.get("sex", "")
                 query_desc = f"为{age}岁{sex}性老人生成健康评估和照护行动计划"
                 logger.info("开始评测 Context Relevance...")
                 eval_result.context_relevance = self.context_relevance_metric.evaluate(
-                    query_desc, retrieved_context
+                    query_desc, short_context
                 )
                 logger.info(
                     "Context Relevance 得分: %.4f (%d/%d)",
@@ -152,9 +155,10 @@ class ReportEvaluator:
                 logger.warning("Context Relevance: 无检索上下文，跳过")
 
         eval_result.metadata = {
-            "has_rag_context": bool(retrieved_context),
+            "has_rag_context": bool(full_context),
             "report_length": len(report_text),
-            "context_length": len(retrieved_context),
+            "full_context_length": len(full_context),
+            "short_context_length": len(short_context),
             "profile_elements_count": len(extract_profile_elements(profile)),
         }
 

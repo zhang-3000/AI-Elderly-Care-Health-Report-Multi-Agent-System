@@ -1415,6 +1415,7 @@ class OrchestratorAgentV2:
             "正在进行结果复核...",
             "结果复核完成",
             lambda: self.review_agent.review(
+                profile,
                 results['status'],
                 results['risk'],
                 results['factors'],
