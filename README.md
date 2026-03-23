@@ -41,38 +41,47 @@ source .venv/bin/activate
 uv sync
 ```
 
-默认行为说明：
-
-- macOS：安装 `corpus` + `retriever-macos`（替代依赖，避免 GPU 包）
-- 非 macOS（Linux/Windows）：安装 `corpus + retriever`
-
-### 4. 可选安装 extras
-
-根据需要安装额外依赖：
-
-```bash
-uv sync --extra generation
-uv sync --extra evaluation
-uv sync --extra all
-```
-
-说明：
-
-- `generation` 在 macOS 上会自动跳过（因为依赖 `vllm` 无 macOS 轮子）
-- `all` 等价于 UltraRAG 的全部可选依赖
-
-### 5. 常见问题
-
-如果安装失败，多半是：
-
-- Python 版本不匹配（务必使用 3.12）
-- 平台不支持 GPU 依赖（macOS 需跳过 `generation` 与 GPU 相关包）
-
 ## 快速开始
 
-1. 准备环境并安装依赖（见上节）
-2. 根据 `docs/` 说明配置运行参数与模型 API Key
-3. 运行 `code/` 下的入口脚本或对应任务流程
+### 1. 准备环境并安装依赖（见上节）
+
+### 2. 配置环境变量
+
+复制模板并填写必要的 API Key：
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`，至少填写以下字段：
+
+| 变量名 | 说明 | 是否必填 |
+|--------|------|----------|
+| `DEEPSEEK_API_KEY` | DeepSeek 模型 API Key | 是 |
+| `DEEPSEEK_BASE_URL` | DeepSeek API 地址 | 是 |
+| `OPENAI_API_KEY` | OpenAI API Key（可选） | 否 |
+| `PINECONE_API_KEY` | Pinecone 向量数据库 Key | 否 |
+
+### 3. 启动后端服务
+
+#### 方式一：使用启动脚本（推荐）
+
+```bash
+./start.sh
+```
+
+脚本会自动检查虚拟环境和 `.env` 配置，然后在 **8001** 端口启动服务。
+
+#### 方式二：手动启动
+
+```bash
+source .venv/bin/activate
+python api/server.py
+```
+
+启动后访问 API 文档：[http://localhost:8001/docs](http://localhost:8001/docs)
+
+> 前端开发服务器默认会将 API 请求代理到 `http://127.0.0.1:8001`，请确保后端先于前端启动。
 
 ## 维护说明
 
