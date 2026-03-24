@@ -54,7 +54,7 @@ class ContextRelevanceResult:
 
 class FaithfulnessMetric:
     """
-    评估报告中每一条事实陈述是否能从检索上下文中找到依据。
+    评估行动计划中每一条事实陈述是否能从检索上下文中找到依据。
     得分 = 被支持的陈述数 / 总陈述数。
     """
 
@@ -84,7 +84,7 @@ class FaithfulnessMetric:
 
     def _extract_statements(self, report_text: str) -> List[str]:
         """使用 LLM 将报告拆解为独立的事实陈述。"""
-        prompt = f"""请将以下健康报告拆解成独立的事实陈述，每行一条。
+        prompt = f"""请将以下健康评估与照护行动计划拆解成独立的事实陈述，每行一条。
 
 要求：
 - 只提取事实性陈述（如"该老人患有高血压"、"建议每天做腿部锻炼"）
@@ -92,7 +92,7 @@ class FaithfulnessMetric:
 - 每条陈述应该是完整的、可独立判断真假的句子
 - 直接输出陈述列表，每行一条，不要编号
 
-报告内容：
+行动计划内容：
 {report_text}"""
 
         response = call_llm(prompt, max_tokens=4096)
@@ -162,7 +162,7 @@ class FaithfulnessMetric:
 
 class ProfileCoverageMetric:
     """
-    评估报告是否覆盖了用户画像中的关键要素。
+    评估行动计划是否覆盖了用户画像中的关键要素。
     得分 = 被覆盖的要素数 / 总要素数。
     """
 
@@ -191,10 +191,10 @@ class ProfileCoverageMetric:
         """使用 LLM 检查报告是否覆盖了每个要素。"""
         numbered = "\n".join(f"{i+1}. {e}" for i, e in enumerate(elements))
 
-        prompt = f"""你是一个评测助手。请判断以下健康报告是否提到或覆盖了每个关键要素。
+        prompt = f"""你是一个评测助手。请判断以下健康评估与照护行动计划是否提到或覆盖了每个关键要素。
 "覆盖"的含义是：报告中直接提及了该要素，或者在相关内容中间接涉及了该信息。
 
-健康报告：
+行动计划内容：
 {report_text}
 
 需要检查的关键要素：

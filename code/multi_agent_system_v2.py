@@ -988,7 +988,7 @@ class ReviewAgentV3(BaseAgent):
     """反思校验 Agent V3 - 检查输出质量和一致性"""
 
     def __init__(self):
-        system_prompt = """你是健康报告质量审核专家，负责检查报告的准确性、一致性和安全性。
+        system_prompt = """你是健康评估与照护行动计划质量审核专家，负责检查报告的准确性、一致性和安全性。
 
 【硬规则核查（必须逐项检查）】
 1. Stage1/Stage3一致性
@@ -1097,7 +1097,7 @@ class ReviewAgentV3(BaseAgent):
 【优先级排序结果】
 {json.dumps(priority_result, ensure_ascii=False, indent=2)}
 """
-        result = self.call_llm(f"审核以下健康评估报告：\n{report_content}")
+        result = self.call_llm(f"审核以下健康评估与照护行动计划：\n{report_content}")
         review_json = self.parse_json(result)
         input_quality = completeness_score(profile)
         review_json["input_quality"] = input_quality
@@ -1111,7 +1111,7 @@ class ReportAgentV2(BaseAgent):
     """报告生成 Agent V2 - 使用新版报告模板"""
 
     def __init__(self):
-        system_prompt = """你是健康报告撰写专家，负责将评估结果整合为"健康评估与照护行动计划"。
+        system_prompt = """你是健康评估与照护行动计划撰写专家，负责将评估结果整合为"健康评估与照护行动计划"。
 
 【报告结构】
 0. 报告说明

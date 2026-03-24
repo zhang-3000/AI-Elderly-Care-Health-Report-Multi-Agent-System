@@ -14,7 +14,7 @@ from multi_agent_system_v2 import (
 
 def main():
     print("=" * 80)
-    print("生成3份不同失能程度的健康评估报告")
+    print("生成3份不同失能程度的健康评估与照护行动计划")
     print("=" * 80)
     
     # 数据文件路径
@@ -104,4 +104,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

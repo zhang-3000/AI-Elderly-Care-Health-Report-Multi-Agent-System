@@ -831,7 +831,7 @@ class ConversationManager:
         reply = (
             f"好了，信息都收集完了！（完成度 {progress * 100:.0f}%）\n\n"
             f"目前整理到的摘要：{'；'.join(summary_parts) if summary_parts else '信息已整理完毕'}。\n\n"
-            "确认信息无误后，我马上开始分析并生成健康评估报告。"
+            "确认信息无误后，我马上开始分析并生成健康评估与照护行动计划。"
         )
         return reply, SessionState.CONFIRMING, {"interaction": self._build_confirm_interaction()}
 
@@ -948,7 +948,13 @@ class ConversationManager:
             if latest_session:
                 messages = json.loads(latest_session.get("messages", "[]"))
                 for message in reversed(messages):
-                    if message["role"] == "assistant" and "# 健康评估" in message["content"]:
+                    if message["role"] != "assistant":
+                        continue
+                    content = message.get("content", "")
+                    if (
+                        "# 健康评估与照护行动计划" in content
+                        or "# 健康评估与照顾行动计划" in content
+                    ):
                         report_content = message["content"]
                         break
 
@@ -981,7 +987,7 @@ class ConversationManager:
         ]
 
         system_msg = (
-            "你是一个AI养老健康助手，刚刚为用户生成了一份健康评估报告。"
+            "你是一个AI养老健康助手，刚刚为用户生成了一份健康评估与照护行动计划。"
             "现在用户有一些问题，请根据报告内容和用户信息，用口语化、亲切的方式回答。"
             f"用户基本信息：{profile_summary}"
         )
@@ -1036,4 +1042,3 @@ class ConversationManager:
         ctx = self._get_ctx(session_id)
         profile = self.store.get_profile(ctx["user_id"])
         return asdict(profile) if profile else None
-
