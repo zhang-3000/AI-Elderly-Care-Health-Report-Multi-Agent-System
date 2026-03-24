@@ -84,13 +84,20 @@ class UserProfile:
     # 人口学
     age: int = None
     sex: str = None
-    province: str = None
     residence: str = None
     education_years: int = None
     marital_status: str = None
 
-    # 健康限制（重要指标）
-    health_limitation: str = None  # e0: 过去6个月是否因健康问题限制了活动
+    # 身体指标
+    weight: float = None
+    height: float = None
+    vision: str = None
+    hearing: str = None
+    waist_circumference: float = None  # 新增字段
+    hip_circumference: float = None  # 新增字段
+
+    # 健康限制
+    health_limitation: str = None
 
     # BADL (6项)
     badl_bathing: str = None
@@ -110,14 +117,62 @@ class UserProfile:
     iadl_crouching: str = None
     iadl_transport: str = None
 
-    # 慢性病
-    hypertension: str = None
-    diabetes: str = None
-    heart_disease: str = None
-    stroke: str = None
-    cataract: str = None
-    cancer: str = None
-    arthritis: str = None
+    # ── 慢性病情况（G6）────────────────────────────────────
+    # 总问：医生是否明确说过有慢性病/需要长期治疗复查
+    chronic_disease_any: str = None  # 有/没有/记不清
+
+    # 心脑血管类
+    hypertension: str = None                 # 高血压
+    coronary_heart_disease: str = None       # 冠心病
+    heart_failure: str = None                # 心力衰竭
+    arrhythmia: str = None                   # 心律失常
+    stroke: str = None                       # 中风或脑血管疾病（建议用这个字段覆盖该项）
+
+    # 代谢与内分泌类
+    diabetes: str = None                     # 糖尿病
+    hyperlipidemia: str = None               # 高血脂
+    thyroid_disease: str = None              # 甲状腺疾病
+
+    # 呼吸系统
+    chronic_lung_disease: str = None         # 慢性支气管炎/肺气肿/哮喘/肺部慢性病
+    tuberculosis: str = None                 # 肺结核
+
+    # 感官系统
+    cataract: str = None                     # 白内障
+    glaucoma: str = None                     # 青光眼
+    hearing_impairment: str = None           # 听力障碍（诊断层面，区别于 hearing=好/一般/差）
+
+    # 消化、肝胆、肾脏
+    peptic_ulcer: str = None                 # 胃肠溃疡
+    cholecystitis_gallstones: str = None     # 胆囊炎或胆石症
+    chronic_kidney_disease: str = None       # 慢性肾病
+    hepatitis: str = None                    # 肝炎
+    chronic_liver_disease: str = None        # 慢性肝病（肝硬化）
+
+    # 神经和认知
+    parkinsons_disease: str = None           # 帕金森病
+    dementia: str = None                     # 痴呆或阿尔茨海默病
+    epilepsy: str = None                     # 癫痫
+
+    # 骨关节与风湿
+    arthritis: str = None                    # 关节炎
+    rheumatism_rheumatoid: str = None        # 风湿或类风湿
+    osteoporosis: str = None                 # 骨质疏松
+
+    # 其他
+    pressure_ulcer: str = None               # 褥疮
+    cancer: str = None                       # 癌症或恶性肿瘤
+    cancer_type: str = None                  # 若选“癌症或恶性肿瘤”，补充癌种
+    frailty: str = None                      # 衰弱
+    fall_history: str = None                 # 跌倒史
+    disability: str = None                   # 失能（对话中作为“其他”项）
+    malnutrition: str = None                 # 营养不良
+    other_chronic_note: str = None           # 其他慢性病补充说明（如有）
+
+    # 性别相关
+    prostate_disease: str = None             # 前列腺疾病（仅男性）
+    breast_disease: str = None               # 乳腺疾病（仅女性）
+    uterine_fibroids: str = None             # 子宫肌瘤（仅女性）
 
     # 认知功能
     cognition_time: str = None
@@ -125,7 +180,6 @@ class UserProfile:
     cognition_season: str = None
     cognition_place: str = None
     cognition_calc: List[str] = None
-    cognition_draw: str = None
 
     # 心理状态
     depression: str = None
@@ -138,17 +192,9 @@ class UserProfile:
     exercise: str = None
     sleep_quality: str = None
 
-    # 生理指标
-    weight: float = None
-    height: float = None
-    vision: str = None
-    hearing: str = None
-
     # 社会支持
     living_arrangement: str = None
-    cohabitants: int = None
     financial_status: str = None
-    income: float = None
     medical_insurance: str = None
     caregiver: str = None
 
@@ -176,9 +222,10 @@ def completeness_score(profile: UserProfile) -> dict:
         "disease": {
             "weight": 0.25,
             "fields": [
-                profile.age, profile.heart_disease, profile.stroke,
-                profile.hypertension, profile.diabetes, profile.arthritis
-            ]
+                profile.age,
+                profile.coronary_heart_disease, profile.heart_failure, profile.arrhythmia, profile.stroke,
+                profile.hypertension, profile.diabetes, profile.arthritis, profile.osteoporosis,
+                profile.chronic_lung_disease, profile.dementia, profile.fall_history, profile.malnutrition]
         },
         "psycho_social": {
             "weight": 0.20,
@@ -371,9 +418,7 @@ class StatusAgentV3(BaseAgent):
 
 【重要参考指标】
 健康限制（e0）："过去6个月是否因健康问题限制了活动"
-- "否" = 无明显健康限制
-- "是，有些限制" = 轻度限制
-- "是，严重限制" = 重度限制
+- 完全没有影响/有一点影响/影响比较明显/影响很大
 这是一个综合健康状态的前置指标，需要结合BADL/IADL综合判断。
 
 【判定标准】
@@ -434,7 +479,7 @@ IADL（工具性日常生活活动）8项：串门、购物、做饭、洗衣、
 - 蹲起: {profile.iadl_crouching}
 - 公共交通: {profile.iadl_transport}
 """
-        result = self.call_llm(f"请判定以下老人的失能状态：\n{badl_info}")
+        result = self.call_llm(f"判定以下老人的失能状态：\n{badl_info}")
         return self.parse_json(result)
 
 
@@ -450,14 +495,14 @@ class RiskAgentV3(BaseAgent):
 1. 优先识别"最要命、最可防"的风险。
 2. 给出具体触发场景，不要抽象描述，得出trigger。
 3. 区分可预防/不可预防，得出preventable。
-4. 在short_term_risks的每一个risk中，展示输入中的1-3个风险原因如（"心脏病=是""IADL不能:提重物"），必须从输入中获得，禁止编造。
+4. 在short_term_risks的每一个risk中，展示输入中的1-3个风险原因如（"慢性病：冠心病"，"IADL不能:提重物"），必须从输入中获得，禁止编造。
 5. 在medium_term_risks中的每一个risk中，展示推理因果链chain（如：营养↓→肌肉↓→跌倒↑）。
 6. 禁止出现/推断输入未提供的具体生活感受，例如"胃口差/吃不下"，而是写"能量与蛋白质摄入可能不足（需结合体重变化判断）"这一类中性判断。
 7. overall_risk_level必须由各个risk的severity分析得出，禁止单独分析。
 
 【高风险因素（CLHLS证据）】
 - 年龄≥85岁、中风病史、认知障碍、多病共存、独居无照护
-- 高血压/糖尿病/心脏病、抑郁、缺乏锻炼、农村低教育
+- 高血压/糖尿病/冠心病、抑郁、缺乏锻炼、农村低教育
 
 【输出格式】JSON
 {
@@ -500,14 +545,18 @@ class RiskAgentV3(BaseAgent):
 【健康限制】
 过去6个月活动限制: {profile.health_limitation}
 
-【慢性病情况】
-- 高血压: {profile.hypertension}
-- 糖尿病: {profile.diabetes}
-- 心脏病: {profile.heart_disease}
-- 中风: {profile.stroke}
-- 白内障: {profile.cataract}
-- 癌症: {profile.cancer}
-- 关节炎: {profile.arthritis}
+【慢性病情况（来自用户选择/记不清）】
+- 慢性病总问: {profile.chronic_disease_any}
+
+心脑血管: 高血压={profile.hypertension}, 冠心病={profile.coronary_heart_disease}, 心衰={profile.heart_failure}, 心律失常={profile.arrhythmia}, 中风/脑血管病={profile.stroke}
+代谢内分泌: 糖尿病={profile.diabetes}, 高血脂={profile.hyperlipidemia}, 甲状腺病={profile.thyroid_disease}
+呼吸: 慢性肺病={profile.chronic_lung_disease}, 肺结核={profile.tuberculosis}
+消化肝胆肾: 溃疡={profile.peptic_ulcer}, 胆囊炎/结石={profile.cholecystitis_gallstones}, 慢性肾病={profile.chronic_kidney_disease}, 肝炎={profile.hepatitis}, 慢性肝病={profile.chronic_liver_disease}
+感官: 白内障={profile.cataract}, 青光眼={profile.glaucoma}, 听力障碍(诊断)={profile.hearing_impairment}
+神经认知: 帕金森={profile.parkinsons_disease}, 痴呆/AD={profile.dementia}, 癫痫={profile.epilepsy}
+骨关节: 关节炎={profile.arthritis}, 风湿/类风湿={profile.rheumatism_rheumatoid}, 骨质疏松={profile.osteoporosis}
+其他: 褥疮={profile.pressure_ulcer}, 癌症={profile.cancer}(类型:{profile.cancer_type}), 衰弱={profile.frailty}, 跌倒史={profile.fall_history}, 营养不良={profile.malnutrition}
+性别相关: 前列腺={profile.prostate_disease}, 乳腺={profile.breast_disease}, 子宫肌瘤={profile.uterine_fibroids}
 
 【认知功能】
 - 时间定向: {profile.cognition_time}
@@ -515,7 +564,6 @@ class RiskAgentV3(BaseAgent):
 - 季节定向: {profile.cognition_season}
 - 地点定向: {profile.cognition_place}
 - 计算能力: {profile.cognition_calc}
-- 画图能力: {profile.cognition_draw}
 
 【心理状态】
 - 抑郁感: {profile.depression}
@@ -533,10 +581,11 @@ class RiskAgentV3(BaseAgent):
 - 身高: {profile.height}cm
 - 视力: {profile.vision}
 - 听力: {profile.hearing}
+- 腰围: {profile.waist_circumference}cm
+- 臀围: {profile.hip_circumference}cm
 
 【社会支持】
 - 居住安排: {profile.living_arrangement}
-- 同住人数: {profile.cohabitants}人
 - 经济状况: {profile.financial_status}
 - 照护者: {profile.caregiver}
 - 医保: {profile.medical_insurance}
@@ -552,8 +601,8 @@ class RiskAgentV3(BaseAgent):
                 risk_keywords.append("高龄老人")
             if profile.stroke in ["是", "有"]:
                 risk_keywords.append("中风")
-            if profile.heart_disease in ["是", "有"]:
-                risk_keywords.append("心脏病")
+            if profile.coronary_heart_disease in ["是", "有"]:
+                risk_keywords.append("冠心病")
             if profile.diabetes in ["是", "有"]:
                 risk_keywords.append("糖尿病")
             if current_status >= 1:
@@ -564,7 +613,7 @@ class RiskAgentV3(BaseAgent):
 
         # 使用 RAG 增强的 LLM 调用
         result = self.call_llm_with_rag(
-            f"请评估以下老人的短期和中期风险：\n{risk_factors}",
+            f"评估以下老人的短期和中期风险：\n{risk_factors}",
             rag_query=rag_query,
             rag_top_k=2
         )
@@ -610,7 +659,7 @@ class FactorAgentV3(BaseAgent):
     ],
     "main_problems": [
         {
-            "problem": "心脏病",
+            "problem": "冠心病",
             "impact": "需要明确类型与严重程度，避免急性加重",
             "priority": 1
         },
@@ -660,14 +709,18 @@ class FactorAgentV3(BaseAgent):
 BADL受限: {status_result.get('badl_details', [])}
 IADL受限: {status_result.get('iadl_details', [])}
 
-【慢性病负担】
-- 高血压: {profile.hypertension}
-- 糖尿病: {profile.diabetes}
-- 心脏病: {profile.heart_disease}
-- 中风: {profile.stroke}
-- 白内障: {profile.cataract}
-- 癌症: {profile.cancer}
-- 关节炎: {profile.arthritis}
+【慢性病情况（来自用户选择/记不清）】
+- 慢性病总问: {profile.chronic_disease_any}
+
+心脑血管: 高血压={profile.hypertension}, 冠心病={profile.coronary_heart_disease}, 心衰={profile.heart_failure}, 心律失常={profile.arrhythmia}, 中风/脑血管病={profile.stroke}
+代谢内分泌: 糖尿病={profile.diabetes}, 高血脂={profile.hyperlipidemia}, 甲状腺病={profile.thyroid_disease}
+呼吸: 慢性肺病={profile.chronic_lung_disease}, 肺结核={profile.tuberculosis}
+消化肝胆肾: 溃疡={profile.peptic_ulcer}, 胆囊炎/结石={profile.cholecystitis_gallstones}, 慢性肾病={profile.chronic_kidney_disease}, 肝炎={profile.hepatitis}, 慢性肝病={profile.chronic_liver_disease}
+感官: 白内障={profile.cataract}, 青光眼={profile.glaucoma}, 听力障碍(诊断)={profile.hearing_impairment}
+神经认知: 帕金森={profile.parkinsons_disease}, 痴呆/AD={profile.dementia}, 癫痫={profile.epilepsy}
+骨关节: 关节炎={profile.arthritis}, 风湿/类风湿={profile.rheumatism_rheumatoid}, 骨质疏松={profile.osteoporosis}
+其他: 褥疮={profile.pressure_ulcer}, 癌症={profile.cancer}(类型:{profile.cancer_type}), 衰弱={profile.frailty}, 跌倒史={profile.fall_history}, 营养不良={profile.malnutrition}
+性别相关: 前列腺={profile.prostate_disease}, 乳腺={profile.breast_disease}, 子宫肌瘤={profile.uterine_fibroids}
 
 【认知功能】
 - 时间定向: {profile.cognition_time}
@@ -675,7 +728,6 @@ IADL受限: {status_result.get('iadl_details', [])}
 - 季节定向: {profile.cognition_season}
 - 地点定向: {profile.cognition_place}
 - 计算能力: {profile.cognition_calc}
-- 画图能力: {profile.cognition_draw}
 
 【心理状态】
 - 抑郁感: {profile.depression}
@@ -689,14 +741,16 @@ IADL受限: {status_result.get('iadl_details', [])}
 - 睡眠质量: {profile.sleep_quality}
 
 【生理指标】
-- 体重: {profile.weight}kg, 身高: {profile.height}cm
+- 体重: {profile.weight}kg
+- 身高: {profile.height}cm
 - {bmi_info}
 - 视力: {profile.vision}
 - 听力: {profile.hearing}
+- 腰围: {profile.waist_circumference}cm
+- 臀围: {profile.hip_circumference}cm
 
 【社会支持】
 - 居住: {profile.living_arrangement}
-- 同住: {profile.cohabitants}人
 - 照护者: {profile.caregiver}
 - 医保: {profile.medical_insurance}
 - 经济: {profile.financial_status}
@@ -719,7 +773,6 @@ class ActionPlanAgentV3(BaseAgent):
         system_prompt = """你是照护行动计划专家。将健康建议转化为可执行的行动计划。
 
 【行动计划要素】
-- 负责人：明确谁来做（家属/照护者/老人自己）
 - 怎么做：具体步骤，可直接执行
 - 完成标准：可验证的结果
 - 时间框架：建议完成时间
@@ -733,7 +786,7 @@ class ActionPlanAgentV3(BaseAgent):
    - 活动与营养
    - 情绪与社交
    - 照护资源对接
-2. 每条 action 必须包含所有字段：action_id/title/subtitle/responsible/how_to_do/completion_criteria/timeframe/difficulty/cost/impact/category。
+2. 每条 action 必须包含所有字段：action_id/title/subtitle/how_to_do/completion_criteria/timeframe/difficulty/cost/impact/category。
 3. 每个行动都要"可落地、可验证、可完成"。
 4. 避免"建议锻炼"、"高质量"这种模糊表述或形容词，而要具体到"每天上下午各5-10分钟"等具体的标准。
 5. 给出"完成标准"而非"做法标准"。
@@ -802,7 +855,7 @@ class ActionPlanAgentV3(BaseAgent):
 居住地: {profile.residence}
 
 【用户类型】
-{profile.user_type}（请根据用户类型调整语言风格）
+{profile.user_type}（根据用户类型调整语言风格）
 
 生成8-12个具体的行动计划，涵盖：
 1. 医疗保障与就医通道
@@ -840,7 +893,7 @@ class ActionPlanAgentV3(BaseAgent):
             context += f"""
 
 【RAG知识库参考】
-以下内容来自项目内置知识库，仅作辅助参考。请结合当前老人的具体情况吸收使用，不要逐字照抄，也不要生成与个体情况矛盾的建议。
+以下内容来自项目内置知识库，仅作辅助参考。结合当前老人的具体情况吸收使用，不要逐字照抄，也不要生成与个体情况矛盾的建议。
 
 {knowledge_context}
 """
@@ -903,7 +956,7 @@ class PriorityAgentV3(BaseAgent):
             "cost_effectiveness": 8
         },
         "weighted_score": 9.0,
-        "reason": ""属于短期重大风险对策，必须进入A类并排在前列""
+        "reason": "属于短期重大风险对策，必须进入A类并排在前列"
         }
     ],
     "priority_b": [],
@@ -1074,6 +1127,13 @@ class ReportAgentV2(BaseAgent):
 - 强调"可以做什么"
 - 每个建议都要具体到怎么做、完成标准
 
+【输出规则】
+- 禁止出现/推断输入未提供的具体生活感受（胃口差/吃不下/没精神等）；如需表达营养风险，用中性句：
+“能量与蛋白质摄入可能不足（需结合体重变化判断）”。
+- 输出报告时，“优势”用口语表达，禁止直接展示括号里的证据，比如
+“您平时不怎么抽烟，这点很加分”。
+
+
 【输出格式】
 直接输出 Markdown 格式的报告，不要 JSON。"""
         super().__init__("ReportAgentV2", system_prompt)
@@ -1087,13 +1147,52 @@ class ReportAgentV2(BaseAgent):
         # 检查是否有紧急情况
         urgent = review_result.get('safety_check', {}).get('urgent', False)
         urgent_reason = review_result.get('safety_check', {}).get('urgent_reason', '')
+        # ---- priority/action 合并：让 Stage7 拿到行动细节，避免编造 ----
+        def _build_action_map(action_result: Dict) -> Dict[str, Dict]:
+            actions = (action_result or {}).get("actions", [])
+            return {a.get("action_id"): a for a in actions if isinstance(a, dict) and a.get("action_id")}
+
+        def _merge_priority_list(priority_list: List[Dict], action_map: Dict[str, Dict]) -> List[Dict]:
+            merged = []
+            for p in (priority_list or []):
+                if not isinstance(p, dict):
+                    continue
+                aid = p.get("action_id")
+                a = action_map.get(aid, {})
+                merged.append({
+                    "action_id": aid,
+                    "rank": p.get("rank"),
+                    "reason": p.get("reason", ""),
+                    "scores": p.get("scores", {}),
+                    "weighted_score": p.get("weighted_score"),
+                    # 关键：把行动内容带上
+                    "title": a.get("title", ""),
+                    "subtitle": a.get("subtitle", ""),
+                    "how_to_do": a.get("how_to_do", []),
+                    "completion_criteria": a.get("completion_criteria", ""),
+                    "timeframe": a.get("timeframe", ""),
+                    "difficulty": a.get("difficulty", ""),
+                    "cost": a.get("cost", ""),
+                    "impact": a.get("impact", ""),
+                    "category": a.get("category", "")
+                })
+            return merged
+
+        action_map = _build_action_map(action_result)
+        priority_a_full = _merge_priority_list(priority_result.get("priority_a", []), action_map)
+        priority_b_full = _merge_priority_list(priority_result.get("priority_b", []), action_map)
+        priority_c_full = _merge_priority_list(priority_result.get("priority_c", []), action_map)
+
+
+
+
 
         context = f"""
-请根据以下评估结果，生成一份完整的"健康评估与照护行动计划"。
+根据以下评估结果，生成一份完整的"健康评估与照护行动计划"。
 
 【用户信息】
 年龄: {profile.age}岁, 性别: {profile.sex}
-用户类型: {profile.user_type}（请据此调整语言风格）
+用户类型: {profile.user_type}（据此调整语言风格）
 
 【状态判定】
 当前状态: {status_result.get('status_name', '未知')}
@@ -1110,16 +1209,16 @@ class ReportAgentV2(BaseAgent):
 短期风险(1-4周): {risk_result.get('short_term_risks', [])}
 中期风险(1-6月): {risk_result.get('medium_term_risks', [])}
 
-【行动计划（已按优先级排序）】
-A级（第一优先）: {priority_result.get('priority_a', [])}
-B级（第二优先）: {priority_result.get('priority_b', [])}
-C级（第三优先）: {priority_result.get('priority_c', [])}
+【行动计划（已按优先级排序，已补全行动细节）】
+A级（第一优先）: {json.dumps(priority_a_full, ensure_ascii=False, indent=2)}
+B级（第二优先）: {json.dumps(priority_b_full, ensure_ascii=False, indent=2)}
+C级（第三优先）: {json.dumps(priority_c_full, ensure_ascii=False, indent=2)}
 
 【审核结果】
 是否紧急: {urgent}
 紧急原因: {urgent_reason}
 
-请按以下结构生成报告：
+按以下结构生成报告：
 
 # 健康评估与照护行动计划
 
@@ -1156,7 +1255,6 @@ C级（第三优先）: {priority_result.get('priority_c', [])}
 ### A. 第一优先级
 [对每个行动，按以下格式输出]
 **1）[行动标题]**
-- 负责人：[谁来做]
 - 怎么做：[具体步骤]
 - 完成标准：[如何验证]
 
