@@ -33,6 +33,7 @@ data/output_chat/
 data/reports/
 data/guidelines
 data/.access_token_secret
+data/
 
 # uv 安装的临时 wheel 包（如 =0.1.0 这类）
 =*/
