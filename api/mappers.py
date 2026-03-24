@@ -357,7 +357,7 @@ def to_frontend_report_data(results: Dict[str, Any]) -> Dict[str, Any]:
                 str(risk.get("risk_summary") or ""),
             ]
         )
-        summary = "；".join([p for p in summary.split("；") if p]) or "已完成健康评估。"
+        summary = "；".join([p for p in summary.split("；") if p]) or "已生成健康评估与照护行动计划。"
 
     health_portrait = {
         "functionalStatus": str(

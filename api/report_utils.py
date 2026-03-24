@@ -9,12 +9,22 @@ import re
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from multi_agent_system_v2 import UserProfile
+if TYPE_CHECKING:
+    from multi_agent_system_v2 import UserProfile
+
+REPORT_TITLE = "健康评估与照护行动计划"
+ALTERNATE_REPORT_TITLE = "健康评估与照顾行动计划"
+LEGACY_REPORT_TITLE = "养老健康评估报告"
+REPORT_DISCLAIMER = (
+    "本报告基于您/家属提供的信息进行风险提示与照护建议，不能替代医生面诊；"
+    "涉及用药与检查，请以医生意见为准。"
+)
+REPORT_FOOTER = "*本报告由 AI 养老健康助手自动生成，仅供参考。请结合专业医生的诊断和建议。*"
 
 
-def profile_to_dict(profile: UserProfile) -> Dict[str, Any]:
+def profile_to_dict(profile: "UserProfile") -> Dict[str, Any]:
     """将 UserProfile 转为可持久化字典。"""
     payload = asdict(profile)
     payload.pop("user_type", None)
@@ -80,122 +90,216 @@ def generate_markdown_report(
     report_data: Dict[str, Any],
     timestamp: datetime,
 ) -> str:
-    """生成 Markdown 格式的健康报告。"""
-    status = results.get("status", {})
-    risk = results.get("risk", {})
-    raw_report = results.get("report", "")
+    """生成 Markdown 格式的健康评估与照护行动计划。"""
+    raw_report = _extract_modern_report(results.get("report", ""))
+    if raw_report:
+        return _ensure_report_footer(raw_report)
+
+    return _render_report_from_structured_data(profile, results, report_data, timestamp)
+
+
+def _normalize_markdown_text(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"^```(?:markdown)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _extract_modern_report(raw_report: Any) -> str:
+    cleaned = _normalize_markdown_text(raw_report)
+    if not cleaned:
+        return ""
+
+    title_variants = [f"# {REPORT_TITLE}", f"# {ALTERNATE_REPORT_TITLE}"]
+    positions = [cleaned.find(title) for title in title_variants if cleaned.find(title) >= 0]
+    if positions:
+        cleaned = cleaned[min(positions) :].strip()
+    elif re.match(r"^##\s*(?:0\.\s*报告说明|1\.\s*健康报告总结)", cleaned):
+        cleaned = f"# {REPORT_TITLE}\n\n{cleaned}"
+    else:
+        return ""
+
+    if cleaned.startswith(f"# {ALTERNATE_REPORT_TITLE}"):
+        cleaned = cleaned.replace(f"# {ALTERNATE_REPORT_TITLE}", f"# {REPORT_TITLE}", 1)
+
+    if cleaned.startswith(f"# {LEGACY_REPORT_TITLE}"):
+        return ""
+
+    return cleaned
+
+
+def _ensure_report_footer(markdown: str) -> str:
+    cleaned = _normalize_markdown_text(markdown)
+    if not cleaned:
+        return ""
+    if REPORT_FOOTER in cleaned:
+        return cleaned
+    return f"{cleaned}\n\n---\n\n{REPORT_FOOTER}"
+
+
+def _coerce_string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _split_summary_lines(summary: Any) -> List[str]:
+    text = str(summary or "").strip()
+    if not text:
+        return []
+
+    numbered_lines = [
+        re.sub(r"^\s*(?:[-*]|\d+[.)、])\s*", "", line).strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+    numbered_lines = [line for line in numbered_lines if line]
+    if len(numbered_lines) > 1:
+        return numbered_lines[:3]
+
+    parts = [part.strip() for part in re.split(r"[；;]\s*", text) if part.strip()]
+    return parts[:3] if parts else [text]
+
+
+def _split_recommendation_description(description: Any) -> tuple[str, str]:
+    text = str(description or "").strip()
+    if not text:
+        return "请结合医生和家属安排稳步落实。", "按计划执行并记录完成情况。"
+
+    parts = [part.strip() for part in re.split(r"[；;]\s*", text) if part.strip()]
+    if len(parts) == 1:
+        return parts[0], "按计划执行并记录完成情况。"
+    return parts[0], "；".join(parts[1:])
+
+
+def _render_report_from_structured_data(
+    profile: Dict[str, Any],
+    results: Dict[str, Any],
+    report_data: Dict[str, Any],
+    timestamp: datetime,
+) -> str:
+    status = results.get("status") if isinstance(results.get("status"), dict) else {}
+    health_portrait = report_data.get("healthPortrait") if isinstance(report_data.get("healthPortrait"), dict) else {}
+    risk_factors = report_data.get("riskFactors") if isinstance(report_data.get("riskFactors"), dict) else {}
+    recommendations = report_data.get("recommendations") if isinstance(report_data.get("recommendations"), dict) else {}
+
+    status_name = str(status.get("status_name") or status.get("status_description") or "待进一步评估").strip()
+    status_description = str(
+        health_portrait.get("functionalStatus") or status.get("status_description") or "当前功能状态信息待补充。"
+    ).strip()
+    summary_lines = _split_summary_lines(report_data.get("summary"))
+    strengths = _coerce_string_list(health_portrait.get("strengths"))
+    problems = _coerce_string_list(health_portrait.get("problems"))
+    short_term = risk_factors.get("shortTerm") if isinstance(risk_factors.get("shortTerm"), list) else []
+    mid_term = risk_factors.get("midTerm") if isinstance(risk_factors.get("midTerm"), list) else []
 
     md_lines = [
-        "# 养老健康评估报告",
+        f"# {REPORT_TITLE}",
         "",
-        "## 报告信息",
-        "",
-        f"- **生成时间**: {timestamp.strftime('%Y年%m月%d日 %H:%M')}",
-        f"- **年龄**: {profile.get('age', '未知')}岁",
-        f"- **性别**: {profile.get('sex', '未知')}",
+        "## 0. 报告说明",
+        REPORT_DISCLAIMER,
         "",
         "## 1. 健康报告总结",
-        "",
     ]
 
-    if raw_report:
-        summary_match = re.search(r"##\s*1\.\s*健康报告总结\s*(.+?)(?:\n##\s|\Z)", raw_report, re.S)
-        if summary_match:
-            md_lines.append(summary_match.group(1).strip())
-        else:
-            md_lines.append(report_data.get("summary", "暂无总结"))
+    if summary_lines:
+        md_lines.extend([f"{idx}. {item}" for idx, item in enumerate(summary_lines, start=1)])
     else:
-        md_lines.append(report_data.get("summary", "暂无总结"))
-    md_lines.append("")
+        md_lines.append(
+            f"1. 本次行动计划生成于 {timestamp.strftime('%Y年%m月%d日 %H:%M')}，已汇总当前可用的健康信息。"
+        )
+        md_lines.append("2. 当前需要优先关注安全风险与功能维护。")
+        md_lines.append(
+            f"3. 请结合{profile.get('age', '当前')}岁{profile.get('sex', '老人')}的实际情况，和家人一起逐项落实行动建议。"
+        )
 
     md_lines.extend(
         [
-            "## 2. 功能状态评估",
             "",
-            f"**状态描述**: {status.get('status_description', '无')}",
+            "## 2. 您的健康画像（现在“好在哪里、短板在哪里”）",
+            f"### （1）功能状态：{status_name}",
+            status_description,
             "",
+            "### （2）优势（需要继续保持）",
         ]
     )
 
-    health_portrait = report_data.get("healthPortrait", {})
-    if health_portrait:
-        md_lines.extend(
-            [
-                "### 健康画像",
-                "",
-                f"**功能状态**: {health_portrait.get('functionalStatus', '无描述')}",
-                "",
-            ]
-        )
+    if strengths:
+        md_lines.extend([f"* {item}" for item in strengths])
+    else:
+        md_lines.append("* 当前优势信息待进一步补充。")
 
-        strengths = health_portrait.get("strengths", [])
-        if strengths:
-            md_lines.append("**优势**:")
-            md_lines.extend([f"- {item}" for item in strengths])
-            md_lines.append("")
+    md_lines.extend(["", "### （3）主要问题（本计划重点要解决的）"])
+    if problems:
+        md_lines.extend([f"{idx}. **{item}**" for idx, item in enumerate(problems, start=1)])
+    else:
+        md_lines.append("1. **当前主要问题待进一步补充**")
 
-        problems = health_portrait.get("problems", [])
-        if problems:
-            md_lines.append("**需要关注的问题**:")
-            md_lines.extend([f"- {item}" for item in problems])
-            md_lines.append("")
+    md_lines.extend(["", "## 3. 风险因素（按时间或优先级最高的事来写，方便落地）", "### 近期（1-4周）重点风险："])
+    if short_term:
+        for item in short_term:
+            name = str(item.get("name") or "近期风险").strip()
+            description = str(item.get("description") or "暂无描述").strip()
+            timeframe = str(item.get("timeframe") or "").strip()
+            suffix = f"（时间范围：{timeframe}）" if timeframe else ""
+            md_lines.append(f"* **{name}**：{description}{suffix}")
+    else:
+        md_lines.append("* 暂未识别出明确的近期高优先级风险。")
 
-    md_lines.extend(["## 3. 风险预测分析", ""])
-    risk_factors = report_data.get("riskFactors", {})
-    for label, items in [("短期风险（1-4周）", risk_factors.get("shortTerm", [])), ("中期风险（1-6月）", risk_factors.get("midTerm", []))]:
-        if not items:
-            continue
-        md_lines.extend([f"### {label}", ""])
-        for item in items:
-            md_lines.extend(
-                [
-                    f"#### {item['name']}",
-                    f"- **风险等级**: {item['level']}",
-                    f"- **时间范围**: {item['timeframe']}",
-                    f"- **描述**: {item['description']}",
-                    "",
-                ]
-            )
-
-    if risk:
-        md_lines.extend(
-            [
-                "**风险总结**:",
-                f"- 短期风险数: {len(risk_factors.get('shortTerm', []))}项",
-                f"- 中期风险数: {len(risk_factors.get('midTerm', []))}项",
-                f"- 风险概况: {risk.get('risk_summary', '无')}",
-                "",
-            ]
-        )
-
-    md_lines.extend(["## 4. 行动建议", ""])
-    recommendations = report_data.get("recommendations", {})
-    for section_title, items in [
-        ("优先级 A - 立即执行", recommendations.get("priority1", [])),
-        ("优先级 B - 本周完成", recommendations.get("priority2", [])),
-        ("优先级 C - 后续跟进", recommendations.get("priority3", [])),
-    ]:
-        if not items:
-            continue
-        md_lines.extend([f"### {section_title}", ""])
-        for item in items:
-            md_lines.extend(
-                [
-                    f"#### {item['title']}",
-                    f"- **类别**: {item['category']}",
-                    f"- **描述**: {item['description']}",
-                    "",
-                ]
-            )
-
-    if raw_report:
-        md_lines.extend(["## 5. 完整评估报告", "", raw_report, ""])
+    md_lines.extend(["", "### 中期（1-6月）重点风险："])
+    if mid_term:
+        for item in mid_term:
+            name = str(item.get("name") or "中期风险").strip()
+            description = str(item.get("description") or "暂无描述").strip()
+            timeframe = str(item.get("timeframe") or "").strip()
+            suffix = f"（时间范围：{timeframe}）" if timeframe else ""
+            md_lines.append(f"* **{name}**：{description}{suffix}")
+    else:
+        md_lines.append("* 暂未识别出明确的中期高优先级风险。")
 
     md_lines.extend(
         [
+            "",
+            "**注：** 风险提示不代表一定会发生，而是提醒优先把“最要命、最可防”的环节补上。",
+            "",
+            "## 4. 健康建议",
+        ]
+    )
+
+    for section_title, items in [
+        ("A. 第一优先级", recommendations.get("priority1")),
+        ("B. 第二优先级", recommendations.get("priority2")),
+        ("C. 第三优先级", recommendations.get("priority3")),
+    ]:
+        md_lines.extend(["", f"### {section_title}"])
+        if isinstance(items, list) and items:
+            for index, item in enumerate(items, start=1):
+                how_to_do, completion = _split_recommendation_description(
+                    item.get("description") if isinstance(item, dict) else ""
+                )
+                title = str(item.get("title") or "待执行事项").strip() if isinstance(item, dict) else "待执行事项"
+                md_lines.extend(
+                    [
+                        f"**{index}）{title}**",
+                        f"* **怎么做**：{how_to_do}",
+                        f"* **完成标准**：{completion}",
+                        "",
+                    ]
+                )
+            if md_lines[-1] == "":
+                md_lines.pop()
+        else:
+            md_lines.append("* 当前暂无该优先级的行动建议。")
+
+    md_lines.extend(
+        [
+            "",
+            "## 5. 温馨寄语",
+            "请和家人按计划一步一步来，优先把安全、活动和日常照护落实好；过程中如果出现明显不适或情况变化，请及时联系医生。",
+            "",
             "---",
             "",
-            "*本报告由 AI 养老健康助手自动生成，仅供参考。请结合专业医生的诊断和建议。*",
+            REPORT_FOOTER,
         ]
     )
     return "\n".join(md_lines)
@@ -204,7 +308,7 @@ def generate_markdown_report(
 def build_report_list_item(payload: Dict[str, Any], fallback_id: str) -> Dict[str, Any]:
     """构造列表场景使用的报告摘要对象。"""
     report_data = payload.get("report_data") if isinstance(payload, dict) else {}
-    title = "健康评估报告"
+    title = REPORT_TITLE
     if isinstance(report_data, dict):
         title = report_data.get("summary") or title
 
