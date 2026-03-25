@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
 from openai import OpenAI
@@ -81,27 +83,25 @@ _DEFAULT_SYSTEM_PROMPT = """\
 """
 
 COUNSELING_SYSTEM_PROMPT = os.getenv("COUNSELING_SYSTEM_PROMPT", _DEFAULT_SYSTEM_PROMPT)
-
-
-# 在 CounselingService 类定义之前添加
-
-def get_elderly_profile(user_id: str) -> Optional[dict]:
-    """
-    根据 user_id 从慢病管理服务获取老年人的完整画像数据。
-    返回包含所有已知字段的字典。
-    若不存在则返回 None
-    """
-    # 示例实现：从数据库读取，或调用远程API
-    # 这里仅做占位，你需要根据实际情况替换
-    profile = {}
-    return profile
-        # ... 62个字段的字典
+PROFILE_SENTINEL_VALUES = {
+    "",
+    "不适用",
+    "无法回答",
+    "99",
+    "888",
+    "999",
+    "none",
+    "null",
+    "未提供",
+    "未知",
+}
 
 class CounselingService:
     """心理咨询服务：管理咨询会话、调用 LLM、持久化消息。"""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, workspace_dir: str | None = None):
         self.db_path = db_path
+        self.workspace_dir = Path(workspace_dir) if workspace_dir else Path(__file__).resolve().parents[1] / "workspace"
         self._client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
         self._init_db()
 
@@ -246,18 +246,123 @@ class CounselingService:
 
     # ── LLM 调用 ─────────────────────────────────────────
 
+    @staticmethod
+    def _is_meaningful_profile_value(value: Any) -> bool:
+        if value is None:
+            return False
+
+        if isinstance(value, str):
+            return value.strip().lower() not in PROFILE_SENTINEL_VALUES
+
+        if isinstance(value, list):
+            return any(CounselingService._is_meaningful_profile_value(item) for item in value)
+
+        if isinstance(value, dict):
+            return any(CounselingService._is_meaningful_profile_value(item) for item in value.values())
+
+        return True
+
+    def _clean_profile_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            normalized = value.strip()
+            return normalized if self._is_meaningful_profile_value(normalized) else None
+
+        if isinstance(value, list):
+            cleaned_items = [self._clean_profile_value(item) for item in value]
+            cleaned_items = [item for item in cleaned_items if self._is_meaningful_profile_value(item)]
+            return cleaned_items or None
+
+        if isinstance(value, dict):
+            cleaned_items = {
+                key: self._clean_profile_value(item)
+                for key, item in value.items()
+            }
+            cleaned_items = {
+                key: item for key, item in cleaned_items.items() if self._is_meaningful_profile_value(item)
+            }
+            return cleaned_items or None
+
+        return value if self._is_meaningful_profile_value(value) else None
+
+    def _merge_profile_sources(self, *sources: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        merged: Dict[str, Any] = {}
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key, value in source.items():
+                cleaned_value = self._clean_profile_value(value)
+                if self._is_meaningful_profile_value(cleaned_value):
+                    merged[key] = cleaned_value
+        return merged
+
+    def _load_profile_from_table(self, table_name: str, column_name: str, user_id: str) -> Dict[str, Any]:
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    f"SELECT {column_name} FROM {table_name} WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()
+        except sqlite3.OperationalError:
+            return {}
+
+        if row is None or not row[column_name]:
+            return {}
+
+        try:
+            profile = json.loads(row[column_name])
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("Failed to decode profile from %s for user=%s", table_name, user_id)
+            return {}
+
+        return profile if isinstance(profile, dict) else {}
+
+    def _load_profile_from_latest_workspace(self, user_id: str) -> Dict[str, Any]:
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    """
+                    SELECT session_id
+                    FROM sessions
+                    WHERE user_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (user_id,),
+                ).fetchone()
+        except sqlite3.OperationalError:
+            return {}
+
+        if row is None or not row["session_id"]:
+            return {}
+
+        profile_path = self.workspace_dir / str(row["session_id"]) / "user_profile.json"
+        if not profile_path.exists():
+            return {}
+
+        try:
+            with profile_path.open("r", encoding="utf-8") as file:
+                profile = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Failed to load workspace profile for user=%s session=%s", user_id, row["session_id"])
+            return {}
+
+        return profile if isinstance(profile, dict) else {}
+
+    def _get_elderly_profile(self, user_id: str) -> Dict[str, Any]:
+        legacy_profile = self._load_profile_from_table("user_profiles", "profile_data", user_id)
+        current_profile = self._load_profile_from_table("users", "profile", user_id)
+        workspace_profile = self._load_profile_from_latest_workspace(user_id)
+        return self._merge_profile_sources(legacy_profile, current_profile, workspace_profile)
+
     def _format_profile_text(self, profile: dict) -> str:
-        """将老人画像字典转换为文字描述，包含所有字段，AI会自行忽略缺失值"""
+        """将老人画像字典转换为文字描述。"""
         lines = []
         lines.append("【以下是这位老人的已知背景信息，供你在对话中使用】")
         lines.append("（注：部分值可能为“不适用”、“无法回答”、“99”、“888”等，代表信息缺失，请忽略）")
 
-        # 遍历所有字段，输出“字段名：字段值”
         for key, value in profile.items():
-
-            # 处理列表类型的字段
             if isinstance(value, list):
-                value_str = ', '.join(str(v) for v in value)
+                value_str = ", ".join(str(v) for v in value)
             else:
                 value_str = str(value)
 
@@ -273,17 +378,14 @@ class CounselingService:
             raise ValueError(f"会话不存在: {session_id}")
         user_id = session["user_id"]
 
-        profile = get_elderly_profile(user_id)          # 调用顶层函数
+        profile = self._get_elderly_profile(user_id)
 
         system_msg = {"role": "system", "content": COUNSELING_SYSTEM_PROMPT}
         messages = [system_msg]
 
         if profile:
             profile_text = self._format_profile_text(profile)
-            context_msg = {"role": "system", "content": profile_text}
-            messages.append(context_msg)
-
-        context_msg = {"role": "system", "content": profile_text}
+            messages.append({"role": "system", "content": profile_text})
 
         # 从历史中剔除 system 消息
         non_system = [m for m in history if m["role"] != "system"]
