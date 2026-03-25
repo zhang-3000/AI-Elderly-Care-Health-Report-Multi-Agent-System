@@ -423,7 +423,7 @@ class EvidenceCoverageMetric:
             matched = next(
                 (
                     row for row in parsed
-                    if isinstance(row, dict) and int(row.get("index", -1)) == idx
+                    if isinstance(row, dict) and self._matches_need_row(row, idx, need)
                 ),
                 None,
             )
@@ -444,6 +444,20 @@ class EvidenceCoverageMetric:
             covered_needs=covered_count,
             needs=details,
         )
+
+    @staticmethod
+    def _matches_need_row(row: Dict[str, Any], idx: int, need: str) -> bool:
+        index_value = row.get("index")
+        try:
+            return int(index_value) == idx
+        except (TypeError, ValueError):
+            pass
+
+        normalized_need = str(need or "").strip()
+        for candidate in (row.get("need"), row.get("requirement"), row.get("index")):
+            if str(candidate or "").strip() == normalized_need:
+                return True
+        return False
 
     @staticmethod
     def _fallback_match_need(need: str, evidence_cards: List[Dict[str, Any]]) -> bool:

@@ -11,6 +11,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR / "code"))
 
 from evaluation.evaluator import ReportEvaluator  # noqa: E402
+from evaluation.metrics import EvidenceCoverageMetric  # noqa: E402
 from evaluation.utils import build_input_evidence_text, build_retrieved_context_text  # noqa: E402
 
 
@@ -117,6 +118,28 @@ class EvaluationPipelineTestCase(unittest.TestCase):
         self.assertEqual(summary["node_evidence_relevance"], 1.0)
         self.assertEqual(summary["evidence_coverage"], 1.0)
         self.assertIn("selected_docs_count", evaluation.metadata)
+
+    @patch("evaluation.metrics.call_llm")
+    def test_evidence_coverage_tolerates_non_numeric_index(self, mock_call_llm):
+        mock_call_llm.return_value = json.dumps(
+            [
+                {
+                    "index": "高血压相关急性心脑血管事件风险",
+                    "covered": True,
+                    "evidence": "控制血压并识别危险信号",
+                }
+            ],
+            ensure_ascii=False,
+        )
+
+        metric = EvidenceCoverageMetric()
+        result = metric.evaluate(
+            ["高血压相关急性心脑血管事件风险"],
+            [{"need": "高血压相关急性心脑血管事件风险", "recommendation": "控制血压并识别危险信号"}],
+        )
+
+        self.assertEqual(result.score, 1.0)
+        self.assertTrue(result.needs[0]["covered"])
 
 
 if __name__ == "__main__":
